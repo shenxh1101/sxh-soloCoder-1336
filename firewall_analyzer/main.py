@@ -97,6 +97,14 @@ class FirewallAnalyzer:
             max_history_days=config.extra.get('audit_max_history_days', 30),
         )
 
+        self.stage_states_path = None
+        if config.extra.get('stage_states_path'):
+            self.stage_states_path = config.extra['stage_states_path']
+        elif config.blacklist.storage_path:
+            base_dir = os.path.dirname(config.blacklist.storage_path)
+            if base_dir:
+                self.stage_states_path = os.path.join(base_dir, 'stage_states.json')
+
         self.rule_engine = RuleEngine()
         self._monitor: Optional[MultiLogMonitor] = None
         self._stop_event = threading.Event()
@@ -348,6 +356,9 @@ class FirewallAnalyzer:
 
         self.rule_engine.on_trigger(on_rule_triggered)
 
+        if self.stage_states_path:
+            self.rule_engine.load_states(storage_path=self.stage_states_path)
+
     def _setup_cleanup_thread(self):
         def cleanup_loop():
             while not self._stop_event.is_set():
@@ -439,6 +450,8 @@ class FirewallAnalyzer:
             self.audit.flush()
         if self.whitelist:
             self.whitelist.flush()
+        if self.rule_engine and self.stage_states_path:
+            self.rule_engine.save_states(storage_path=self.stage_states_path)
         if self.blacklist:
             self.blacklist.cleanup_expired()
         self._print_stats()
@@ -578,6 +591,42 @@ def main():
         help='显示最近24小时告警审计报告 / Show last 24 hours audit report',
     )
     parser.add_argument(
+        '--audit-ip',
+        type=str,
+        metavar='IP',
+        help='查看指定IP的完整时间线 / Show full timeline for an IP',
+    )
+    parser.add_argument(
+        '--audit-ip-1h',
+        type=str,
+        metavar='IP',
+        help='查看指定IP最近1小时时间线 / Show last 1h timeline for an IP',
+    )
+    parser.add_argument(
+        '--audit-ip-24h',
+        type=str,
+        metavar='IP',
+        help='查看指定IP最近24小时时间线 / Show last 24h timeline for an IP',
+    )
+    parser.add_argument(
+        '--audit-rule',
+        type=str,
+        metavar='RULE_ID',
+        help='查看指定规则的完整时间线 / Show full timeline for a rule',
+    )
+    parser.add_argument(
+        '--audit-rule-1h',
+        type=str,
+        metavar='RULE_ID',
+        help='查看指定规则最近1小时时间线 / Show last 1h timeline for a rule',
+    )
+    parser.add_argument(
+        '--audit-rule-24h',
+        type=str,
+        metavar='RULE_ID',
+        help='查看指定规则最近24小时时间线 / Show last 24h timeline for a rule',
+    )
+    parser.add_argument(
         '--whitelist-stats',
         action='store_true',
         help='显示白名单统计报告 / Show whitelist statistics report',
@@ -591,6 +640,11 @@ def main():
         '--whitelist-stats-24h',
         action='store_true',
         help='显示最近24小时白名单统计 / Show last 24 hours whitelist stats',
+    )
+    parser.add_argument(
+        '--whitelist-trend',
+        action='store_true',
+        help='显示白名单1h/24h/全量三口径趋势对比 / Show whitelist 1h/24h/all trend',
     )
 
     args = parser.parse_args()
@@ -656,6 +710,43 @@ def main():
 
     if args.whitelist_stats:
         analyzer.whitelist.print_whitelist_report(hours=None)
+        sys.exit(0)
+
+    if args.audit_ip_1h:
+        analyzer.audit.print_timeline(
+            hours=1, ip_address=args.audit_ip_1h,
+            blacklist_lookup=analyzer.blacklist.get_entry,
+        )
+        sys.exit(0)
+
+    if args.audit_ip_24h:
+        analyzer.audit.print_timeline(
+            hours=24, ip_address=args.audit_ip_24h,
+            blacklist_lookup=analyzer.blacklist.get_entry,
+        )
+        sys.exit(0)
+
+    if args.audit_ip:
+        analyzer.audit.print_timeline(
+            hours=None, ip_address=args.audit_ip,
+            blacklist_lookup=analyzer.blacklist.get_entry,
+        )
+        sys.exit(0)
+
+    if args.audit_rule_1h:
+        analyzer.audit.print_timeline(hours=1, rule_id=args.audit_rule_1h)
+        sys.exit(0)
+
+    if args.audit_rule_24h:
+        analyzer.audit.print_timeline(hours=24, rule_id=args.audit_rule_24h)
+        sys.exit(0)
+
+    if args.audit_rule:
+        analyzer.audit.print_timeline(hours=None, rule_id=args.audit_rule)
+        sys.exit(0)
+
+    if args.whitelist_trend:
+        analyzer.whitelist.print_trend_report()
         sys.exit(0)
 
     if args.show_blacklist:

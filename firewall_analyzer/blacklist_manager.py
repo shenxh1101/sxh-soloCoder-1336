@@ -24,7 +24,10 @@ class BlacklistEntry:
     reason: str = ""
     rule_id: str = ""
     expire_at: Optional[datetime] = None
+    first_blocked_at: Optional[datetime] = None
     hits: int = 1
+    renewal_count: int = 0
+    action_type: str = "initial"  # initial / escalation / renewal
     extra: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -33,10 +36,17 @@ class BlacklistEntry:
             return False
         return datetime.now() > self.expire_at
 
+    @property
+    def remaining(self) -> Optional[timedelta]:
+        if not self.expire_at:
+            return None
+        return max(timedelta(0), self.expire_at - datetime.now())
+
     def to_dict(self) -> dict:
         data = asdict(self)
         data['added_at'] = self.added_at.isoformat()
         data['expire_at'] = self.expire_at.isoformat() if self.expire_at else None
+        data['first_blocked_at'] = self.first_blocked_at.isoformat() if self.first_blocked_at else None
         return data
 
     @classmethod
@@ -47,7 +57,10 @@ class BlacklistEntry:
             reason=data.get('reason', ''),
             rule_id=data.get('rule_id', ''),
             expire_at=datetime.fromisoformat(data['expire_at']) if data.get('expire_at') else None,
+            first_blocked_at=datetime.fromisoformat(data['first_blocked_at']) if data.get('first_blocked_at') else None,
             hits=data.get('hits', 1),
+            renewal_count=data.get('renewal_count', 0),
+            action_type=data.get('action_type', 'initial'),
             extra=data.get('extra', {}),
         )
         return entry
@@ -379,6 +392,52 @@ class BlacklistManager:
             logger.error(f"Error checking system block status for {ip}: {e}")
             return ip in self._entries
 
+    @staticmethod
+    def _determine_action(existing: Optional['BlacklistEntry'],
+                          rule_id: str,
+                          expire_hours: Optional[float],
+                          extra: Optional[dict]) -> tuple[str, Optional[datetime]]:
+        """返回 (action_type, new_expire_at)
+           action_type: initial / escalation / renewal
+        """
+        now = datetime.now()
+        if expire_hours is None:
+            new_delta = None
+        else:
+            new_delta = timedelta(hours=expire_hours)
+
+        if existing is None:
+            return 'initial', (now + new_delta if new_delta else None)
+
+        old_stage = (existing.extra or {}).get('stage')
+        new_stage = (extra or {}).get('stage')
+        old_expire_h = None
+        if existing.expire_at and existing.added_at:
+            try:
+                old_expire_h = (existing.expire_at - existing.added_at).total_seconds() / 3600.0
+            except Exception:
+                old_expire_h = None
+
+        stage_upgraded = (
+            new_stage is not None and old_stage is not None and
+            str(new_stage) != str(old_stage)
+        )
+        expire_increased = (
+            expire_hours is not None and old_expire_h is not None and
+            expire_hours > old_expire_h * 1.5
+        )
+        rule_changed = bool(rule_id) and existing.rule_id and rule_id != existing.rule_id
+
+        if stage_upgraded or expire_increased or rule_changed:
+            return 'escalation', (now + new_delta if new_delta else None)
+
+        # renewal: 在当前到期时间基础上叠加（若已过期则从现在算起）
+        if existing.expire_at and new_delta:
+            if existing.expire_at > now:
+                return 'renewal', existing.expire_at + new_delta
+            return 'renewal', now + new_delta
+        return 'renewal', (now + new_delta if new_delta else existing.expire_at)
+
     def block_ip(
         self,
         ip: str,
@@ -393,67 +452,57 @@ class BlacklistManager:
 
         self._stats['block_attempts'] += 1
 
-        if self.strict_consistency and self._check_in_blacklist(ip):
-            logger.info(f"IP {ip} is already blocked at system level")
-            existing = self._entries.get(ip)
-            if existing:
-                existing.hits += 1
-                existing.added_at = datetime.now()
-                existing.reason = reason or existing.reason
-                existing.rule_id = rule_id or existing.rule_id
-                expire_h = expire_hours if expire_hours is not None else self.default_expire_hours
-                if expire_h:
-                    existing.expire_at = datetime.now() + timedelta(hours=expire_h)
-                if extra:
-                    existing.extra.update(extra)
-                if self.auto_save:
-                    self._save()
-                self._stats['block_success'] += 1
-                for cb in self._on_block_callbacks:
-                    try:
-                        cb(existing)
-                    except Exception as e:
-                        logger.error(f"Error in block callback: {e}")
-                return True
-            else:
-                in_system = True
-        else:
-            in_system = False
-
-        comment = f"{rule_id}: {reason}".strip(": ")
-        logger.debug(f"[BLOCK-ATTEMPT] Executing system command to block {ip}...")
-        success = self.firewall.block_ip(ip, comment=comment)
-
-        if not success:
-            self._stats['block_failed'] += 1
-            logger.error(
-                f"[BLOCK-FAILED] System command failed for IP {ip}. "
-                f"Not adding to internal blacklist to maintain consistency."
-            )
-            return False
-
-        expire_at = None
+        existing = self._entries.get(ip)
         expire_h = expire_hours if expire_hours is not None else self.default_expire_hours
-        if expire_h:
-            expire_at = datetime.now() + timedelta(hours=expire_h)
+        action_type, new_expire_at = self._determine_action(existing, rule_id, expire_h, extra)
 
+        system_was_blocked = False
+        if self.strict_consistency:
+            system_was_blocked = self._check_in_blacklist(ip)
+            if not system_was_blocked:
+                comment = f"{rule_id}: {reason}".strip(": ")
+                logger.debug(f"[BLOCK-ATTEMPT] Executing system command to block {ip}...")
+                if not self.firewall.block_ip(ip, comment=comment):
+                    self._stats['block_failed'] += 1
+                    logger.error(
+                        f"[BLOCK-FAILED] System command failed for IP {ip}. "
+                        f"Not adding to internal blacklist to maintain consistency."
+                    )
+                    return False
+        else:
+            comment = f"{rule_id}: {reason}".strip(": ")
+            self.firewall.block_ip(ip, comment=comment)
+
+        now = datetime.now()
         if ip in self._entries:
             entry = self._entries[ip]
+            previous_expire = entry.expire_at
             entry.hits += 1
-            entry.added_at = datetime.now()
+            entry.added_at = now
             entry.reason = reason or entry.reason
             entry.rule_id = rule_id or entry.rule_id
-            entry.expire_at = expire_at
+            entry.expire_at = new_expire_at
+            entry.action_type = action_type
+            if action_type == 'renewal':
+                entry.renewal_count = (entry.renewal_count or 0) + 1
+            if not entry.first_blocked_at:
+                entry.first_blocked_at = now
             if extra:
                 entry.extra.update(extra)
+            entry.extra['action_type'] = action_type
+            if previous_expire:
+                entry.extra['previous_expire_at'] = previous_expire.isoformat()
         else:
             entry = BlacklistEntry(
                 ip_address=ip,
-                added_at=datetime.now(),
+                added_at=now,
+                first_blocked_at=now,
                 reason=reason,
                 rule_id=rule_id,
-                expire_at=expire_at,
-                extra=extra or {},
+                expire_at=new_expire_at,
+                action_type=action_type,
+                renewal_count=0,
+                extra=dict(extra or {}, action_type=action_type),
             )
             self._entries[ip] = entry
 
@@ -470,9 +519,16 @@ class BlacklistManager:
             self._stats['inconsistencies_found'] += 1
             return False
 
+        type_label = {
+            'initial': 'INITIAL',
+            'escalation': 'ESCALATION ↑',
+            'renewal': 'RENEWAL +',
+        }.get(action_type, action_type.upper())
+
         logger.warning(
-            f"[BLOCK-SUCCESS] {ip} | reason: {reason or 'N/A'} | "
-            f"rule: {rule_id or 'N/A'} | "
+            f"[BLOCK-{type_label}] {ip} | reason: {reason or 'N/A'} | "
+            f"rule: {rule_id or 'N/A'} | stage: {(extra or {}).get('stage', '-')} | "
+            f"renewals: {entry.renewal_count} | "
             f"expires: {entry.expire_at.isoformat() if entry.expire_at else 'never'}"
         )
 

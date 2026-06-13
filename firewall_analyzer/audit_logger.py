@@ -214,6 +214,164 @@ class AuditLogger:
             self._save(force=True)
             logger.info(f"Audit log flushed: {len(self._alerts)} alerts, {len(self._blocks)} blocks")
 
+    def get_timeline(self, hours: Optional[int] = None,
+                     ip_address: Optional[str] = None,
+                     rule_id: Optional[str] = None) -> list[dict]:
+        """返回按时间排序的告警+封禁混合时间线"""
+        events: list[dict] = []
+        alerts = self.get_alerts(hours=hours, ip_address=ip_address, rule_id=rule_id)
+        blocks = self.get_blocks(hours=hours, ip_address=ip_address, rule_id=rule_id)
+
+        for a in alerts:
+            events.append({
+                'type': 'alert',
+                'timestamp': a.timestamp,
+                'rule_id': a.rule_id,
+                'rule_name': a.rule_name,
+                'ip_address': a.ip_address,
+                'count': a.count,
+                'time_window': a.time_window,
+                'action': a.action,
+                'stage': a.stage,
+                'escalated': a.extra.get('escalated', False),
+                'obj': a,
+            })
+        for b in blocks:
+            if b.unblocked_at is not None:
+                events.append({
+                    'type': 'unblock',
+                    'timestamp': b.unblocked_at,
+                    'rule_id': b.rule_id,
+                    'rule_name': '',
+                    'ip_address': b.ip_address,
+                    'reason': b.unblock_reason or 'expired/manual',
+                    'obj': b,
+                })
+            events.append({
+                'type': 'block',
+                'timestamp': b.timestamp,
+                'rule_id': b.rule_id,
+                'rule_name': '',
+                'ip_address': b.ip_address,
+                'reason': b.reason,
+                'stage': b.stage,
+                'expire_at': b.expire_at,
+                'unblocked_at': b.unblocked_at,
+                'action_type': b.extra.get('action_type', ''),
+                'renewal_count': b.extra.get('renewal_count', 0),
+                'obj': b,
+            })
+        events.sort(key=lambda e: e['timestamp'])
+        return events
+
+    def print_timeline(self, hours: Optional[int] = None,
+                       ip_address: Optional[str] = None,
+                       rule_id: Optional[str] = None,
+                       blacklist_lookup: Optional[Any] = None):
+        if hours:
+            scope = f"最近 {hours} 小时"
+        else:
+            scope = "全部历史"
+        filters = []
+        if ip_address:
+            filters.append(f"IP={ip_address}")
+        if rule_id:
+            filters.append(f"规则={rule_id}")
+        filter_str = " | ".join(filters) if filters else "全部"
+
+        print(f"\n{'=' * 90}")
+        print(f"  审计时间线 / Audit Timeline - {scope} ({filter_str})")
+        print(f"{'=' * 90}")
+
+        events = self.get_timeline(hours=hours, ip_address=ip_address, rule_id=rule_id)
+        if not events:
+            print("  暂无时间线事件")
+            print(f"{'=' * 90}\n")
+            return
+
+        type_map = {'alert': '⚡ ALERT', 'block': '🔒 BLOCK', 'unblock': '🔓 UNBLOCK'}
+        print(f"  {'时间':<20} {'类型':<14} {'IP/规则':<22} {'详情'}")
+        print(f"  {'-' * 88}")
+        for e in events:
+            ts = e['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
+            tlabel = type_map.get(e['type'], e['type'].upper())
+            if e['type'] == 'alert':
+                target = f"{e.get('ip_address') or '-':<18} {e.get('rule_id','')[:16]}"
+                stage = f" [stage:{e.get('stage','-')}]" if e.get('stage') else ''
+                esc = " [ESCALATED↑]" if e.get('escalated') else ''
+                detail = (
+                    f"触发 {e.get('count', '?')} 次 / {e.get('time_window', '?')}s"
+                    f" | actions: {e.get('action','')}{stage}{esc}"
+                )
+            elif e['type'] == 'block':
+                target = f"{e.get('ip_address') or '-':<18} {e.get('rule_id','')[:16]}"
+                at = ''
+                if e.get('action_type'):
+                    at = {
+                        'initial': '[首次]', 'escalation': '[升级↑]', 'renewal': '[续期+]',
+                    }.get(e['action_type'], f"[{e['action_type']}]")
+                exp_str = ''
+                if e.get('expire_at'):
+                    if e.get('unblocked_at'):
+                        exp_str = f" (已于 {e['unblocked_at'].strftime('%m-%d %H:%M')} 解封)"
+                    else:
+                        remaining = e['expire_at'] - datetime.now()
+                        if remaining.total_seconds() > 0:
+                            h, rem = divmod(int(remaining.total_seconds()), 3600)
+                            m = rem // 60
+                            exp_str = f" (剩余 {h}h{m}m)"
+                        else:
+                            exp_str = " (已过期)"
+                rn = f" 续:{e['renewal_count']}" if e.get('renewal_count') else ''
+                detail = f"{e.get('reason','')}{at}{rn}{exp_str}"
+            else:  # unblock
+                target = f"{e.get('ip_address') or '-':<18} -"
+                detail = f"原因: {e.get('reason','-')}"
+            print(f"  {ts:<20} {tlabel:<14} {target:<22} {detail[:100]}")
+
+        # 当前封禁状态
+        if ip_address and blacklist_lookup is not None:
+            print(f"\n📍 当前状态 / Current Status for {ip_address}")
+            print(f"{'-' * 90}")
+            try:
+                entry = blacklist_lookup(ip_address)
+            except Exception:
+                entry = None
+            if entry:
+                remaining = None
+                if entry.expire_at:
+                    rem = entry.expire_at - datetime.now()
+                    if rem.total_seconds() > 0:
+                        remaining = rem
+                rem_str = (
+                    f"{int(remaining.total_seconds() // 3600)}h{int((remaining.total_seconds() % 3600) // 60)}m"
+                    if remaining else '已过期/永久'
+                )
+                at = {
+                    'initial': '首次封禁', 'escalation': '阶段升级', 'renewal': '续期封禁',
+                }.get(getattr(entry, 'action_type', ''), getattr(entry, 'action_type', '-'))
+                print(f"  状态: 🔒 已封禁 | 原因: {entry.reason or '-'}")
+                print(f"  首次封禁: {entry.first_blocked_at.strftime('%Y-%m-%d %H:%M') if getattr(entry, 'first_blocked_at', None) else '-'}")
+                print(f"  本次动作: {at} | 续期次数: {getattr(entry, 'renewal_count', 0)} | 命中次数: {entry.hits}")
+                print(f"  到期时间: {entry.expire_at.strftime('%Y-%m-%d %H:%M') if entry.expire_at else '永久'} | 剩余: {rem_str}")
+            else:
+                active_blocks = [
+                    b for b in self.get_blocks(ip_address=ip_address, active_only=True)
+                ]
+                if active_blocks:
+                    latest = active_blocks[-1]
+                    rem = latest.expire_at - datetime.now() if latest.expire_at else None
+                    rem_str = (
+                        f"{int(rem.total_seconds() // 3600)}h{int((rem.total_seconds() % 3600) // 60)}m"
+                        if rem and rem.total_seconds() > 0 else '永久/未知'
+                    )
+                    print(f"  状态: 🔒 可能仍在封禁（查询器无数据但审计显示未过期） | 剩余: {rem_str}")
+                else:
+                    print(f"  状态: ✅ 当前未封禁")
+
+        print(f"  共 {len(events)} 条事件")
+        print(f"{'=' * 90}\n")
+
     def get_alerts(self, hours: Optional[int] = None, rule_id: Optional[str] = None,
                    ip_address: Optional[str] = None) -> list[AlertEvent]:
         result = list(self._alerts)
@@ -228,7 +386,7 @@ class AuditLogger:
         return result
 
     def get_blocks(self, hours: Optional[int] = None, active_only: bool = False,
-                   ip_address: Optional[str] = None) -> list[BlockEvent]:
+                   ip_address: Optional[str] = None, rule_id: Optional[str] = None) -> list[BlockEvent]:
         result = list(self._blocks)
         if hours:
             cutoff = datetime.now() - timedelta(hours=hours)
@@ -238,6 +396,8 @@ class AuditLogger:
             result = [b for b in result if b.unblocked_at is None and (b.expire_at is None or b.expire_at > now)]
         if ip_address:
             result = [b for b in result if b.ip_address == ip_address]
+        if rule_id:
+            result = [b for b in result if b.rule_id == rule_id]
         result.sort(key=lambda b: b.timestamp, reverse=True)
         return result
 

@@ -528,3 +528,71 @@ class WhitelistManager:
         else:
             print(f"  时间范围: 全部历史")
         print(f"{'=' * 80}\n")
+
+    def print_trend_report(self, limit: int = 20):
+        print(f"\n{'=' * 100}")
+        print(f"  白名单趋势对比 / Whitelist Trend Report - 1h vs 24h vs 全部历史")
+        print(f"{'=' * 100}")
+
+        s1 = self.get_hit_stats(hours=1)
+        s24 = self.get_hit_stats(hours=24)
+        s_all = self.get_hit_stats(hours=None)
+
+        # 按 24h 命中数排序
+        sorted_rids = sorted(
+            s_all.keys(),
+            key=lambda r: (
+                s24.get(r, {}).get('hits', 0),
+                s1.get(r, {}).get('hits', 0),
+                s_all.get(r, {}).get('hits', 0),
+            ),
+            reverse=True,
+        )[:limit]
+
+        if sorted_rids:
+            print(
+                f"\n  {'#':<3} {'规则':<24} {'1h命中':>8} {'24h命中':>9} "
+                f"{'全部命中':>9} {'1h跳过':>8} {'24h跳过':>9} {'全部跳过':>9} {'最近命中':<18}"
+            )
+            print(f"  {'-' * 96}")
+            for i, rid in enumerate(sorted_rids, 1):
+                a1, a24, aa = s1.get(rid, {}), s24.get(rid, {}), s_all.get(rid, {})
+                h1, h24, ha = a1.get('hits', 0), a24.get('hits', 0), aa.get('hits', 0)
+                k1, k24, ka = a1.get('skipped_blocks', 0), a24.get('skipped_blocks', 0), aa.get('skipped_blocks', 0)
+                last_hit = aa.get('last_hit')
+                last_str = last_hit.strftime('%Y-%m-%d %H:%M') if last_hit else 'never'
+                name = aa.get('name', rid)[:22]
+
+                # 异常标记：1h命中占24h的比例偏高（短时间爆量）
+                flag = ''
+                if h24 >= 5 and h1 >= h24 * 0.5:
+                    flag = ' ⚠ SPIKE'
+                elif h24 == 0 and h1 > 0:
+                    flag = ' ⚡ NEW'
+                elif ha > 0 and h24 == 0 and h1 == 0:
+                    flag = ' 💤 IDLE'
+
+                print(
+                    f"  {i:<3} {name:<24} {h1:>8} {h24:>9} {ha:>9} "
+                    f"{k1:>8} {k24:>9} {ka:>9} {last_str:<18}{flag}"
+                )
+        else:
+            print("  暂无白名单命中数据")
+
+        # 概览
+        tot1 = sum(v.get('hits', 0) for v in s1.values())
+        tot24 = sum(v.get('hits', 0) for v in s24.values())
+        tot_all = sum(v.get('hits', 0) for v in s_all.values())
+        skip1 = sum(v.get('skipped_blocks', 0) for v in s1.values())
+        skip24 = sum(v.get('skipped_blocks', 0) for v in s24.values())
+        skip_all = sum(v.get('skipped_blocks', 0) for v in s_all.values())
+
+        print(f"\n📈 总览 / Totals")
+        print(f"{'-' * 100}")
+        print(f"  {'':<27} {'1小时':>10} {'24小时':>10} {'全部历史':>10}")
+        print(f"  总命中次数:                {tot1:>10} {tot24:>10} {tot_all:>10}")
+        print(f"  跳过封禁次数:              {skip1:>10} {skip24:>10} {skip_all:>10}")
+        print(f"  命中规则数:                {sum(1 for v in s1.values() if v.get('hits',0)>0):>10} "
+              f"{sum(1 for v in s24.values() if v.get('hits',0)>0):>10} "
+              f"{sum(1 for v in s_all.values() if v.get('hits',0)>0):>10}")
+        print(f"{'=' * 100}\n")

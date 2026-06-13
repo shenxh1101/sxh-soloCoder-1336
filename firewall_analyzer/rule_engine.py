@@ -1,11 +1,12 @@
 import re
+import os
 import time
 import json
 import logging
 import ipaddress
 import threading
 from collections import deque, defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta
 from typing import Any, Callable, Optional, Union
 from abc import ABC, abstractmethod
@@ -513,6 +514,62 @@ class RuleEngine:
     def on_trigger(self, callback: Callable[[Rule, RuleActionContext], None]):
         self._on_trigger_callbacks.append(callback)
 
+    def save_states(self, storage_path: Optional[str] = None) -> Optional[dict]:
+        """将所有 StageEscalator 的触发历史和阶段状态序列化"""
+        data = {
+            'saved_at': datetime.now().isoformat(),
+            'escalators': {
+                rid: esc.to_dict() for rid, esc in self._escalators.items()
+            },
+        }
+        if not storage_path:
+            return data
+        try:
+            dir_path = os.path.dirname(storage_path)
+            if dir_path and not os.path.exists(dir_path):
+                os.makedirs(dir_path, exist_ok=True)
+            tmp_path = f"{storage_path}.tmp"
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, storage_path)
+            logger.info(f"Stage states saved to {storage_path} ({len(self._escalators)} escalators)")
+        except Exception as e:
+            logger.error(f"Failed to save stage states: {e}")
+        return data
+
+    def load_states(self, storage_path: Optional[str] = None, data: Optional[dict] = None):
+        """从磁盘或字典恢复所有 StageEscalator 的阶段和触发历史"""
+        if data is None and storage_path and os.path.exists(storage_path):
+            try:
+                with open(storage_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+            except Exception as e:
+                logger.error(f"Failed to load stage states from {storage_path}: {e}")
+                return
+        if not data:
+            return
+        escalators_data = data.get('escalators') or {}
+        loaded = 0
+        for rule_id, esc_data in escalators_data.items():
+            if rule_id not in self._escalators:
+                rule = self._rules.get(rule_id)
+                if not rule or not rule.stages:
+                    continue
+                self._escalators[rule_id] = StageEscalator(
+                    stages=rule.stages,
+                    cooldown_minutes=rule.stage_cooldown_minutes,
+                )
+            try:
+                saved_esc = StageEscalator.from_dict(esc_data)
+                current_esc = self._escalators[rule_id]
+                for k, state in saved_esc._states.items():
+                    current_esc._states[k] = state
+                loaded += 1
+            except Exception as e:
+                logger.error(f"Failed to restore escalator for {rule_id}: {e}")
+                continue
+        logger.info(f"Stage states loaded for {loaded}/{len(self._escalators)} rules")
+
     def process_entry(self, entry: LogEntry) -> list[RuleMatchResult]:
         results: list[RuleMatchResult] = []
 
@@ -764,6 +821,31 @@ class StageState:
     last_escalation: Optional[datetime] = None
     extra: dict = field(default_factory=dict)
 
+    def to_dict(self) -> dict:
+        return {
+            'current_stage': self.current_stage,
+            'trigger_history': [t.isoformat() for t in self.trigger_history],
+            'last_escalation': self.last_escalation.isoformat() if self.last_escalation else None,
+            'extra': dict(self.extra),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "StageState":
+        try:
+            th = [datetime.fromisoformat(t) for t in (data.get('trigger_history') or [])]
+        except Exception:
+            th = []
+        try:
+            le = datetime.fromisoformat(data['last_escalation']) if data.get('last_escalation') else None
+        except Exception:
+            le = None
+        return cls(
+            current_stage=int(data.get('current_stage', 0)),
+            trigger_history=th,
+            last_escalation=le,
+            extra=dict(data.get('extra', {})),
+        )
+
 
 class StageEscalator:
     def __init__(self, stages: list[EscalationStage], cooldown_minutes: int = 120):
@@ -771,6 +853,24 @@ class StageEscalator:
         self.cooldown_minutes = cooldown_minutes
         self._states: dict[str, StageState] = {}
         self._lock = threading.Lock()
+
+    def to_dict(self) -> dict:
+        return {
+            'stages': [asdict(s) for s in self.stages],
+            'cooldown_minutes': self.cooldown_minutes,
+            'states': {k: v.to_dict() for k, v in self._states.items()},
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "StageEscalator":
+        stages = [EscalationStage.from_dict(s) for s in (data.get('stages') or [])]
+        obj = cls(stages=stages, cooldown_minutes=int(data.get('cooldown_minutes', 120)))
+        for k, v in (data.get('states') or {}).items():
+            try:
+                obj._states[k] = StageState.from_dict(v)
+            except Exception:
+                continue
+        return obj
 
     def get_stage(self, key: str) -> tuple[int, str]:
         state = self._states.get(key)
