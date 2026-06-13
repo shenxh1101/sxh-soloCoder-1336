@@ -209,6 +209,11 @@ class AuditLogger:
                     logger.debug(f"[AUDIT-UNBLOCK] {ip_address} | reason={reason}")
                     return
 
+    def flush(self):
+        with self._lock:
+            self._save(force=True)
+            logger.info(f"Audit log flushed: {len(self._alerts)} alerts, {len(self._blocks)} blocks")
+
     def get_alerts(self, hours: Optional[int] = None, rule_id: Optional[str] = None,
                    ip_address: Optional[str] = None) -> list[AlertEvent]:
         result = list(self._alerts)

@@ -401,12 +401,24 @@ class BlacklistManager:
                 existing.added_at = datetime.now()
                 existing.reason = reason or existing.reason
                 existing.rule_id = rule_id or existing.rule_id
+                expire_h = expire_hours if expire_hours is not None else self.default_expire_hours
+                if expire_h:
+                    existing.expire_at = datetime.now() + timedelta(hours=expire_h)
                 if extra:
                     existing.extra.update(extra)
                 if self.auto_save:
                     self._save()
                 self._stats['block_success'] += 1
+                for cb in self._on_block_callbacks:
+                    try:
+                        cb(existing)
+                    except Exception as e:
+                        logger.error(f"Error in block callback: {e}")
                 return True
+            else:
+                in_system = True
+        else:
+            in_system = False
 
         comment = f"{rule_id}: {reason}".strip(": ")
         logger.debug(f"[BLOCK-ATTEMPT] Executing system command to block {ip}...")

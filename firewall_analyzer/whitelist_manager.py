@@ -255,33 +255,62 @@ class WhitelistManager:
 
     def check(self, entry: LogEntry, would_block: bool = False) -> Optional[WhitelistMatch]:
         for rule in self._rules:
+            if not rule.enabled:
+                continue
             match = rule.matches(entry)
             if match.matched:
                 with self._lock:
-                    self._hit_count[rule.id] = self._hit_count.get(rule.id, 0) + 1
-                    self._last_hit[rule.id] = datetime.now()
+                    hit_marker = f"_wl_hit_{rule.id}"
+                    skip_marker = f"_wl_skip_{rule.id}"
+                    hist_marker = f"_wl_hist_{rule.id}"
 
+                    hit_added_now = False
+                    skip_added_now = False
+
+                    if not entry.extra.get(hit_marker):
+                        self._hit_count[rule.id] = self._hit_count.get(rule.id, 0) + 1
+                        self._last_hit[rule.id] = datetime.now()
+                        entry.extra[hit_marker] = True
+                        hit_added_now = True
+
+                    skip_now = False
                     if would_block and rule.exclude_from_blocking:
-                        self._skipped_blocks[rule.id] = self._skipped_blocks.get(rule.id, 0) + 1
+                        if not entry.extra.get(skip_marker):
+                            self._skipped_blocks[rule.id] = self._skipped_blocks.get(rule.id, 0) + 1
+                            entry.extra[skip_marker] = True
+                            skip_added_now = True
+                        skip_now = True
 
-                    hit = WhitelistHit(
-                        id=f"wl_hit_{int(time.time()*1000)}_{id(self)}",
-                        timestamp=datetime.now(),
-                        rule_id=rule.id,
-                        rule_name=rule.name,
-                        source_ip=entry.source_ip,
-                        dest_ip=entry.dest_ip,
-                        source_port=entry.source_port,
-                        dest_port=entry.dest_port,
-                        protocol=entry.protocol,
-                        skipped_block=would_block and rule.exclude_from_blocking,
-                        reason=match.reason,
-                    )
-                    self._hit_history.append(hit)
-                    self._save()
+                    if not entry.extra.get(hist_marker):
+                        hit = WhitelistHit(
+                            id=f"wl_hit_{int(time.time()*1000)}_{id(self)}",
+                            timestamp=datetime.now(),
+                            rule_id=rule.id,
+                            rule_name=rule.name,
+                            source_ip=entry.source_ip,
+                            dest_ip=entry.dest_ip,
+                            source_port=entry.source_port,
+                            dest_port=entry.dest_port,
+                            protocol=entry.protocol,
+                            skipped_block=skip_now,
+                            reason=match.reason,
+                        )
+                        self._hit_history.append(hit)
+                        entry.extra[hist_marker] = id(hit)
+                        hit_added_now = True
+                    elif skip_added_now:
+                        # Update the existing history entry's skipped_block flag
+                        existing_hit_id = entry.extra.get(hist_marker)
+                        for h in reversed(self._hit_history):
+                            if id(h) == existing_hit_id:
+                                h.skipped_block = True
+                                break
+
+                    if hit_added_now or skip_added_now:
+                        self._save()
 
                 if rule.log_hits:
-                    skip_msg = " [BLOCK-SKIPPED]" if (would_block and rule.exclude_from_blocking) else ""
+                    skip_msg = " [BLOCK-SKIPPED]" if (would_block and rule.exclude_from_blocking and skip_now) else ""
                     logger.info(
                         f"[WHITELIST-HIT] Rule: {rule.name} ({rule.id}) | "
                         f"Reason: {match.reason} | "
@@ -305,29 +334,38 @@ class WhitelistManager:
                 return match
         return None
 
-    def get_hit_stats(self) -> dict[str, dict]:
+    def get_hit_stats(self, hours: Optional[int] = None) -> dict[str, dict]:
         stats = {}
+        cutoff = datetime.now() - timedelta(hours=hours) if hours else None
+
         for rule in self._rules:
+            history = self._hit_history
+            if cutoff is not None:
+                history = [h for h in history if h.timestamp >= cutoff]
+
+            rule_hits = [h for h in history if h.rule_id == rule.id]
+            total = len(rule_hits)
+            skipped = sum(1 for h in rule_hits if h.skipped_block)
+            ips = set(h.source_ip for h in rule_hits if h.source_ip)
+            last = max((h.timestamp for h in rule_hits), default=None)
             stats[rule.id] = {
                 'name': rule.name,
                 'description': rule.description,
                 'priority': rule.priority,
                 'enabled': rule.enabled,
-                'hits': self._hit_count.get(rule.id, 0),
-                'last_hit': self._last_hit.get(rule.id),
-                'skipped_blocks': self._skipped_blocks.get(rule.id, 0),
-                'ip_count': len(set(
-                    h.source_ip for h in self._hit_history
-                    if h.rule_id == rule.id and h.source_ip
-                )),
+                'hits': total,
+                'last_hit': last,
+                'skipped_blocks': skipped,
+                'ip_count': len(ips),
             }
         return stats
 
-    def get_top_rules(self, limit: int = 20, sort_by: str = 'hits') -> list[dict]:
-        stats = self.get_hit_stats()
+    def get_top_rules(self, limit: int = 20, sort_by: str = 'hits',
+                      hours: Optional[int] = None) -> list[dict]:
+        stats = self.get_hit_stats(hours=hours)
         sorted_stats = sorted(
             stats.values(),
-            key=lambda s: s.get(sort_by, 0),
+            key=lambda s: s.get(sort_by, 0) or 0,
             reverse=True,
         )[:limit]
         return sorted_stats
@@ -437,7 +475,7 @@ class WhitelistManager:
 
         print(f"\n📊 命中排行榜 / Top Hit Rules")
         print(f"{'-' * 80}")
-        top_rules = self.get_top_rules(limit=limit, sort_by='hits')
+        top_rules = self.get_top_rules(limit=limit, sort_by='hits', hours=hours)
         if top_rules:
             print(
                 f"  {'#':<3} {'规则ID':<18} {'名称':<22} {'命中':<6} "
@@ -469,9 +507,15 @@ class WhitelistManager:
                     f"{h.source_ip or '-':<18} {dest[:19]:<20} {h.reason[:30]}"
                 )
 
-        total_hits = sum(self._hit_count.values())
-        total_skipped = sum(self._skipped_blocks.values())
-        unique_ips = len(set(h.source_ip for h in self._hit_history if h.source_ip))
+        if hours:
+            window_hits = self.get_hits(hours=hours)
+            total_hits = len(window_hits)
+            total_skipped = sum(1 for h in window_hits if h.skipped_block)
+            unique_ips = len(set(h.source_ip for h in window_hits if h.source_ip))
+        else:
+            total_hits = sum(self._hit_count.values())
+            total_skipped = sum(self._skipped_blocks.values())
+            unique_ips = len(set(h.source_ip for h in self._hit_history if h.source_ip))
 
         print(f"\n📈 概览统计 / Overview")
         print(f"{'-' * 80}")
@@ -480,7 +524,7 @@ class WhitelistManager:
         print(f"  跳过封禁次数: {total_skipped}")
         print(f"  命中唯一IP数: {unique_ips}")
         if hours:
-            recent_hits = len(self.get_hits(hours=hours))
-            recent_skipped = len(self.get_hits(hours=hours, skipped_only=True))
-            print(f"  最近{hours}h命中: {recent_hits} | 跳过封禁: {recent_skipped}")
+            print(f"  时间范围: 最近 {hours} 小时")
+        else:
+            print(f"  时间范围: 全部历史")
         print(f"{'=' * 80}\n")

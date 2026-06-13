@@ -435,6 +435,10 @@ class FirewallAnalyzer:
         self._stop_event.set()
         if self._monitor:
             self._monitor.stop()
+        if self.audit:
+            self.audit.flush()
+        if self.whitelist:
+            self.whitelist.flush()
         if self.blacklist:
             self.blacklist.cleanup_expired()
         self._print_stats()
