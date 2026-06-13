@@ -1,0 +1,156 @@
+log_level: INFO
+
+log_file: logs/analyzer.log
+
+log_sources:
+  - path: /var/log/iptables.log
+    parser: iptables
+    from_beginning: false
+    poll_interval: 1.0
+    encoding: utf-8
+
+  - path: /var/log/syslog
+    parser: syslog
+    from_beginning: false
+    poll_interval: 1.0
+
+blacklist:
+  enabled: true
+  storage_path: data/blacklist.json
+  default_expire_hours: 24
+  auto_save: true
+
+rules:
+  - id: brute_force_ssh
+    name: SSH Brute Force Detection
+    description: 同一IP一小时内SSH(22)端口拒绝超过10次则拉黑
+    enabled: true
+
+    conditions:
+      - field: dest_port
+        operator: eq
+        value: 22
+      - field: action
+        operator: eq
+        value: DENY
+      - field: source_ip
+        operator: is_public_ip
+        value: true
+
+    threshold: 10
+    time_window: 3600
+    group_by: source_ip
+    cooldown: 300
+
+    burst_threshold: 5
+    burst_window: 10
+
+    actions:
+      - type: block
+        reason: SSH Brute Force Detected
+        expire_hours: 24
+
+      - type: command
+        command: 'echo "{IP} blocked due to SSH brute force" >> /var/log/fw_blocks.log'
+        shell: true
+
+      - type: log
+        level: WARNING
+        message: SSH brute force attack detected from {IP}
+
+  - id: port_scan
+    name: Port Scan Detection
+    description: 同一IP一分钟内访问超过20个不同端口则拉黑
+    enabled: true
+
+    conditions:
+      - field: action
+        operator: eq
+        value: DENY
+      - field: source_ip
+        operator: is_public_ip
+        value: true
+
+    threshold: 20
+    time_window: 60
+    group_by: source_ip+dest_port
+    cooldown: 600
+
+    actions:
+      - type: block
+        reason: Port Scan Detected
+        expire_hours: 12
+
+      - type: log
+        level: CRITICAL
+        message: Port scan detected from {IP}
+
+  - id: windows_rdp_brute
+    name: Windows RDP Brute Force
+    description: RDP登录失败超过5次拉黑（Windows安全日志）
+    enabled: true
+
+    conditions:
+      - field: dest_port
+        operator: eq
+        value: 3389
+      - field: action
+        operator: eq
+        value: DENY
+
+    threshold: 5
+    time_window: 300
+    group_by: source_ip
+    cooldown: 600
+
+    actions:
+      - type: block
+        reason: RDP Brute Force Detected
+        expire_hours: 24
+
+  - id: deny_aggressive
+    name: Aggressive Deny Blocker
+    description: 同一IP5分钟内被拒绝超过50次则拉黑
+    enabled: true
+
+    conditions:
+      - field: action
+        operator: eq
+        value: DENY
+      - field: source_ip
+        operator: is_public_ip
+        value: true
+
+    threshold: 50
+    time_window: 300
+    group_by: source_ip
+    cooldown: 120
+
+    actions:
+      - type: block
+        reason: Aggressive Deny Traffic
+        expire_hours: 6
+
+  - id: telnet_detection
+    name: Telnet Access Block
+    description: 任何访问Telnet端口(23)的IP立即拉黑
+    enabled: true
+
+    conditions:
+      - field: dest_port
+        operator: eq
+        value: 23
+
+    threshold: 1
+    time_window: 60
+    group_by: source_ip
+    cooldown: 0
+
+    actions:
+      - type: block
+        reason: Telnet Access Attempt
+        expire_hours: 48
+
+      - type: log
+        level: ALERT
+        message: Telnet access attempt from {IP}
