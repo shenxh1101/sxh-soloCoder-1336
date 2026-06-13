@@ -412,10 +412,14 @@ class Rule:
     burst_threshold: Optional[int] = None
     burst_window: int = 10
     auto_unblock_hours: Optional[float] = None
+    stages: list[EscalationStage] = field(default_factory=list)
+    stage_cooldown_minutes: int = 120
     actions: list[dict] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict) -> "Rule":
+        stages_data = data.get('stages', data.get('escalation_stages', []))
+        stages = [EscalationStage.from_dict(s) for s in stages_data]
         return cls(
             id=data.get('id', ''),
             name=data.get('name', data.get('id', 'Unnamed Rule')),
@@ -429,6 +433,8 @@ class Rule:
             burst_threshold=data.get('burst_threshold'),
             burst_window=data.get('burst_window', 10),
             auto_unblock_hours=data.get('auto_unblock_hours'),
+            stages=stages,
+            stage_cooldown_minutes=int(data.get('stage_cooldown_minutes', 120)),
             actions=data.get('actions', []),
         )
 
@@ -438,6 +444,7 @@ class RuleEngine:
         self._rules: dict[str, Rule] = {}
         self._evaluators: dict[str, ConditionEvaluator] = {}
         self._triggers: dict[str, ThresholdTrigger] = {}
+        self._escalators: dict[str, StageEscalator] = {}
         self._action_handlers: dict[str, Callable[[RuleActionContext], None]] = {}
         self._on_trigger_callbacks: list[Callable[[Rule, RuleActionContext], None]] = []
 
@@ -465,7 +472,18 @@ class RuleEngine:
             burst_window_seconds=rule.burst_window,
         )
         self._triggers[rule.id] = self._trigger
-        logger.info(f"Added rule: {rule.id} - {rule.name}")
+
+        if rule.stages:
+            self._escalators[rule.id] = StageEscalator(
+                stages=rule.stages,
+                cooldown_minutes=rule.stage_cooldown_minutes,
+            )
+            logger.info(
+                f"Added rule: {rule.id} - {rule.name} | "
+                f"stages: {len(rule.stages)} level(s)"
+            )
+        else:
+            logger.info(f"Added rule: {rule.id} - {rule.name}")
 
     def add_rule_from_dict(self, data: dict):
         self.add_rule(Rule.from_dict(data))
@@ -474,6 +492,7 @@ class RuleEngine:
         self._rules.pop(rule_id, None)
         self._evaluators.pop(rule_id, None)
         self._triggers.pop(rule_id, None)
+        self._escalators.pop(rule_id, None)
         logger.info(f"Removed rule: {rule_id}")
 
     def get_rule(self, rule_id: str) -> Optional[Rule]:
@@ -481,6 +500,12 @@ class RuleEngine:
 
     def list_rules(self) -> list[Rule]:
         return list(self._rules.values())
+
+    def get_stage_info(self, rule_id: str, key: str) -> tuple[int, str]:
+        escalator = self._escalators.get(rule_id)
+        if not escalator:
+            return 0, ""
+        return escalator.get_stage(key)
 
     def register_action_handler(self, action_type: str, handler: Callable[[RuleActionContext], None]):
         self._action_handlers[action_type] = handler
@@ -529,10 +554,34 @@ class RuleEngine:
         return results
 
     def _handle_trigger(self, rule: Rule, key: Optional[str], entries: list[LogEntry], count: int):
-        logger.warning(
-            f"Rule triggered: [{rule.id}] {rule.name} | "
-            f"key={key} | count={count} | threshold={rule.threshold}"
-        )
+        stage = 0
+        stage_label = ""
+        escalated = False
+        stage_actions: list[dict] = []
+        effective_auto_unblock = rule.auto_unblock_hours
+
+        escalator = self._escalators.get(rule.id)
+        if escalator and key:
+            stage, stage_label, escalated, stage_actions = escalator.record_trigger(key)
+
+        if stage_actions:
+            for sa in stage_actions:
+                if 'expire_hours' in sa and effective_auto_unblock is None:
+                    effective_auto_unblock = sa['expire_hours']
+                elif 'expire_hours' in sa and effective_auto_unblock is not None:
+                    effective_auto_unblock = max(effective_auto_unblock, sa['expire_hours'])
+
+        if stage > 0:
+            logger.warning(
+                f"Rule triggered: [{rule.id}] {rule.name} | "
+                f"key={key} | count={count} | threshold={rule.threshold} | "
+                f"STAGE={stage} ({stage_label})" + (" [ESCALATED]" if escalated else "")
+            )
+        else:
+            logger.warning(
+                f"Rule triggered: [{rule.id}] {rule.name} | "
+                f"key={key} | count={count} | threshold={rule.threshold}"
+            )
 
         ip_address = None
         if key:
@@ -551,23 +600,46 @@ class RuleEngine:
             extra={
                 'key': key,
                 'threshold': rule.threshold,
-                'auto_unblock_hours': rule.auto_unblock_hours,
+                'auto_unblock_hours': effective_auto_unblock,
+                'stage': stage,
+                'stage_label': stage_label,
+                'escalated': escalated,
             },
         )
 
-        for action_def in rule.actions:
+        all_actions = list(rule.actions) + stage_actions
+        action_names = set()
+        for action_def in all_actions:
             action_type = action_def.get('type', action_def.get('action', ''))
-            params = {k: v for k, v in action_def.items() if k not in ('type', 'action')}
-            context.extra.update(params)
+            stage_filter = action_def.get('stage')
+            if stage_filter is not None and stage_filter != stage:
+                continue
+
+            params = {k: v for k, v in action_def.items() if k not in ('type', 'action', 'stage')}
+            context_copy_extra = dict(context.extra)
+            context_copy_extra.update(params)
+
+            handler_ctx = RuleActionContext(
+                rule_id=context.rule_id,
+                rule_name=context.rule_name,
+                ip_address=context.ip_address,
+                entries=context.entries,
+                count=context.count,
+                time_window=context.time_window,
+                extra=context_copy_extra,
+            )
 
             handler = self._action_handlers.get(action_type)
             if handler:
                 try:
-                    handler(context)
+                    handler(handler_ctx)
+                    action_names.add(action_type)
                 except Exception as e:
                     logger.error(f"Error in action handler {action_type}: {e}", exc_info=True)
             else:
                 logger.debug(f"No handler registered for action type: {action_type}")
+
+        context.extra['executed_actions'] = list(action_names)
 
         for callback in self._on_trigger_callbacks:
             try:
@@ -632,6 +704,8 @@ def send_webhook_action(context: RuleActionContext):
                 v = v.replace('{RULE_NAME}', context.rule_name)
                 v = v.replace('{COUNT}', str(context.count))
                 v = v.replace('{TIME_WINDOW}', str(context.time_window))
+                v = v.replace('{STAGE}', context.extra.get('stage', ''))
+                v = v.replace('{STAGE_LABEL}', context.extra.get('stage_label', ''))
                 payload[k] = v
     else:
         payload = {
@@ -641,6 +715,8 @@ def send_webhook_action(context: RuleActionContext):
             'ip_address': context.ip_address,
             'count': context.count,
             'time_window': context.time_window,
+            'stage': context.extra.get('stage', ''),
+            'stage_label': context.extra.get('stage_label', ''),
             'timestamp': datetime.now().isoformat(),
             'source_ips': list(set(e.source_ip for e in context.entries if e.source_ip))[:20],
             'sample_logs': [e.raw_line for e in context.entries[:5]],
@@ -651,11 +727,122 @@ def send_webhook_action(context: RuleActionContext):
     if status >= 200 and status < 300:
         logger.info(
             f"[ACTION:WEBHOOK] Successfully sent to {url} | "
-            f"status={status} | ip={context.ip_address}"
+            f"status={status} | ip={context.ip_address} | stage={context.extra.get('stage', '')}"
         )
     else:
         logger.warning(
             f"[ACTION:WEBHOOK] Failed to send to {url} | "
             f"status={status} | response={response[:200]}"
         )
+
+
+@dataclass
+class EscalationStage:
+    stage: int
+    label: str
+    description: str = ""
+    min_triggers: int = 1
+    within_minutes: int = 60
+    actions: list[dict] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "EscalationStage":
+        return cls(
+            stage=int(data.get('stage', 1)),
+            label=data.get('label', data.get('name', f'Stage {data.get("stage", 1)}')),
+            description=data.get('description', ''),
+            min_triggers=int(data.get('min_triggers', data.get('triggers', 1))),
+            within_minutes=int(data.get('within_minutes', data.get('window_minutes', 60))),
+            actions=data.get('actions', []),
+        )
+
+
+@dataclass
+class StageState:
+    current_stage: int = 0
+    trigger_history: list[datetime] = field(default_factory=list)
+    last_escalation: Optional[datetime] = None
+    extra: dict = field(default_factory=dict)
+
+
+class StageEscalator:
+    def __init__(self, stages: list[EscalationStage], cooldown_minutes: int = 120):
+        self.stages = sorted(stages, key=lambda s: s.stage)
+        self.cooldown_minutes = cooldown_minutes
+        self._states: dict[str, StageState] = {}
+        self._lock = threading.Lock()
+
+    def get_stage(self, key: str) -> tuple[int, str]:
+        state = self._states.get(key)
+        if not state:
+            return 0, ""
+        self._cleanup_state(state)
+        if state.current_stage == 0:
+            return 0, ""
+        for s in self.stages:
+            if s.stage == state.current_stage:
+                return s.stage, s.label
+        return state.current_stage, ""
+
+    def record_trigger(self, key: str) -> tuple[int, str, bool, list[dict]]:
+        now = datetime.now()
+        with self._lock:
+            if key not in self._states:
+                self._states[key] = StageState()
+            state = self._states[key]
+
+            state.trigger_history.append(now)
+            self._cleanup_state(state)
+
+            escalated = False
+            actions_to_run: list[dict] = []
+
+            old_stage = state.current_stage
+
+            for stage_cfg in self.stages:
+                if stage_cfg.stage <= state.current_stage:
+                    continue
+                window_start = now - timedelta(minutes=stage_cfg.within_minutes)
+                triggers_in_window = sum(
+                    1 for t in state.trigger_history if t >= window_start
+                )
+                if triggers_in_window >= stage_cfg.min_triggers:
+                    state.current_stage = stage_cfg.stage
+                    state.last_escalation = now
+                    actions_to_run.extend(stage_cfg.actions)
+                    escalated = True
+                    logger.info(
+                        f"[STAGE-ESCALATION] Key={key} upgraded to stage "
+                        f"{stage_cfg.stage} ({stage_cfg.label}) | "
+                        f"triggers={triggers_in_window} within {stage_cfg.within_minutes}min"
+                    )
+
+            stage_label = ""
+            for s in self.stages:
+                if s.stage == state.current_stage:
+                    stage_label = s.label
+                    break
+
+            return state.current_stage, stage_label, escalated, actions_to_run
+
+    def _cleanup_state(self, state: StageState):
+        if not self.stages:
+            return
+        max_window = max(s.within_minutes for s in self.stages)
+        cutoff = datetime.now() - timedelta(minutes=max(max_window, self.cooldown_minutes))
+        state.trigger_history = [t for t in state.trigger_history if t >= cutoff]
+
+        if state.current_stage > 0 and state.last_escalation:
+            cooldown_cutoff = datetime.now() - timedelta(minutes=self.cooldown_minutes)
+            if state.last_escalation < cooldown_cutoff and not state.trigger_history:
+                logger.debug(f"[STAGE-RESET] Stage cooldown expired, resetting to stage 0")
+                state.current_stage = 0
+                state.last_escalation = None
+
+    def reset(self, key: Optional[str] = None):
+        with self._lock:
+            if key:
+                self._states.pop(key, None)
+            else:
+                self._states.clear()
 

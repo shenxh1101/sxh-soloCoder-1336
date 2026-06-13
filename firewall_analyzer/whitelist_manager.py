@@ -1,8 +1,12 @@
 import re
+import os
+import json
+import time
 import ipaddress
 import logging
-from dataclasses import dataclass, field
-from datetime import datetime
+import threading
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timedelta
 from typing import Optional, Union, Any
 
 from .log_parser import LogEntry
@@ -17,6 +21,32 @@ class WhitelistMatch:
     rule_id: str
     reason: str = ""
     match_fields: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class WhitelistHit:
+    id: str
+    timestamp: datetime
+    rule_id: str
+    rule_name: str
+    source_ip: Optional[str]
+    dest_ip: Optional[str]
+    source_port: Optional[int]
+    dest_port: Optional[int]
+    protocol: Optional[str]
+    skipped_block: bool = False
+    reason: str = ""
+
+    def to_dict(self) -> dict:
+        d = asdict(self)
+        d['timestamp'] = self.timestamp.isoformat()
+        return d
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "WhitelistHit":
+        d = dict(data)
+        d['timestamp'] = datetime.fromisoformat(d['timestamp'])
+        return cls(**d)
 
 
 @dataclass
@@ -174,21 +204,34 @@ class WhitelistRule:
 
 
 class WhitelistManager:
-    def __init__(self, rules: Optional[list[WhitelistRule]] = None):
+    def __init__(self, rules: Optional[list[WhitelistRule]] = None,
+                 storage_path: Optional[str] = None,
+                 max_history_days: int = 30):
         self._rules: list[WhitelistRule] = []
         self._hit_count: dict[str, int] = {}
         self._last_hit: dict[str, datetime] = {}
+        self._skipped_blocks: dict[str, int] = {}
+        self._hit_history: list[WhitelistHit] = []
+        self._storage_path = storage_path
+        self._max_history_days = max_history_days
+        self._lock = threading.Lock()
+        self._last_save = 0.0
+        self._auto_save_interval = 30
 
         if rules:
             for rule in rules:
                 self.add_rule(rule)
+
+        if self._storage_path:
+            self._load()
 
     def add_rule(self, rule: WhitelistRule):
         if not rule.id:
             rule.id = f"whitelist_{len(self._rules) + 1}"
         self._rules.append(rule)
         self._rules.sort(key=lambda r: r.priority)
-        self._hit_count[rule.id] = 0
+        self._hit_count[rule.id] = self._hit_count.get(rule.id, 0)
+        self._skipped_blocks[rule.id] = self._skipped_blocks.get(rule.id, 0)
         logger.info(f"Added whitelist rule: {rule.id} - {rule.name} (priority={rule.priority})")
 
     def add_rule_from_dict(self, data: dict):
@@ -198,6 +241,7 @@ class WhitelistManager:
         self._rules = [r for r in self._rules if r.id != rule_id]
         self._hit_count.pop(rule_id, None)
         self._last_hit.pop(rule_id, None)
+        self._skipped_blocks.pop(rule_id, None)
         logger.info(f"Removed whitelist rule: {rule_id}")
 
     def get_rule(self, rule_id: str) -> Optional[WhitelistRule]:
@@ -209,20 +253,41 @@ class WhitelistManager:
     def list_rules(self) -> list[WhitelistRule]:
         return list(self._rules)
 
-    def check(self, entry: LogEntry) -> Optional[WhitelistMatch]:
+    def check(self, entry: LogEntry, would_block: bool = False) -> Optional[WhitelistMatch]:
         for rule in self._rules:
             match = rule.matches(entry)
             if match.matched:
-                self._hit_count[rule.id] = self._hit_count.get(rule.id, 0) + 1
-                self._last_hit[rule.id] = datetime.now()
+                with self._lock:
+                    self._hit_count[rule.id] = self._hit_count.get(rule.id, 0) + 1
+                    self._last_hit[rule.id] = datetime.now()
+
+                    if would_block and rule.exclude_from_blocking:
+                        self._skipped_blocks[rule.id] = self._skipped_blocks.get(rule.id, 0) + 1
+
+                    hit = WhitelistHit(
+                        id=f"wl_hit_{int(time.time()*1000)}_{id(self)}",
+                        timestamp=datetime.now(),
+                        rule_id=rule.id,
+                        rule_name=rule.name,
+                        source_ip=entry.source_ip,
+                        dest_ip=entry.dest_ip,
+                        source_port=entry.source_port,
+                        dest_port=entry.dest_port,
+                        protocol=entry.protocol,
+                        skipped_block=would_block and rule.exclude_from_blocking,
+                        reason=match.reason,
+                    )
+                    self._hit_history.append(hit)
+                    self._save()
 
                 if rule.log_hits:
+                    skip_msg = " [BLOCK-SKIPPED]" if (would_block and rule.exclude_from_blocking) else ""
                     logger.info(
                         f"[WHITELIST-HIT] Rule: {rule.name} ({rule.id}) | "
                         f"Reason: {match.reason} | "
                         f"Source: {entry.source_ip}:{entry.source_port or '-'} | "
                         f"Dest: {entry.dest_ip}:{entry.dest_port or '-'} | "
-                        f"Total hits: {self._hit_count[rule.id]}"
+                        f"Total hits: {self._hit_count[rule.id]}{skip_msg}"
                     )
 
                 return match
@@ -233,7 +298,7 @@ class WhitelistManager:
         return self.check(entry) is not None
 
     def should_exclude_from_blocking(self, entry: LogEntry) -> Optional[WhitelistMatch]:
-        match = self.check(entry)
+        match = self.check(entry, would_block=True)
         if match and match.matched:
             rule = self.get_rule(match.rule_id)
             if rule and rule.exclude_from_blocking:
@@ -245,16 +310,177 @@ class WhitelistManager:
         for rule in self._rules:
             stats[rule.id] = {
                 'name': rule.name,
+                'description': rule.description,
+                'priority': rule.priority,
+                'enabled': rule.enabled,
                 'hits': self._hit_count.get(rule.id, 0),
                 'last_hit': self._last_hit.get(rule.id),
+                'skipped_blocks': self._skipped_blocks.get(rule.id, 0),
+                'ip_count': len(set(
+                    h.source_ip for h in self._hit_history
+                    if h.rule_id == rule.id and h.source_ip
+                )),
             }
         return stats
 
-    def reset_stats(self, rule_id: Optional[str] = None):
+    def get_top_rules(self, limit: int = 20, sort_by: str = 'hits') -> list[dict]:
+        stats = self.get_hit_stats()
+        sorted_stats = sorted(
+            stats.values(),
+            key=lambda s: s.get(sort_by, 0),
+            reverse=True,
+        )[:limit]
+        return sorted_stats
+
+    def get_hits(self, hours: Optional[int] = None, rule_id: Optional[str] = None,
+                 skipped_only: bool = False) -> list[WhitelistHit]:
+        result = list(self._hit_history)
+        if hours:
+            cutoff = datetime.now() - timedelta(hours=hours)
+            result = [h for h in result if h.timestamp >= cutoff]
         if rule_id:
-            self._hit_count[rule_id] = 0
-            self._last_hit.pop(rule_id, None)
+            result = [h for h in result if h.rule_id == rule_id]
+        if skipped_only:
+            result = [h for h in result if h.skipped_block]
+        result.sort(key=lambda h: h.timestamp, reverse=True)
+        return result
+
+    def reset_stats(self, rule_id: Optional[str] = None):
+        with self._lock:
+            if rule_id:
+                self._hit_count[rule_id] = 0
+                self._last_hit.pop(rule_id, None)
+                self._skipped_blocks[rule_id] = 0
+            else:
+                for rid in self._hit_count:
+                    self._hit_count[rid] = 0
+                    self._skipped_blocks[rid] = 0
+                self._last_hit.clear()
+
+    def _save(self, force: bool = False):
+        if not self._storage_path:
+            return
+        now = time.time()
+        if not force and (now - self._last_save) < self._auto_save_interval:
+            return
+        try:
+            self._cleanup_old()
+            data = {
+                'saved_at': datetime.now().isoformat(),
+                'hit_count': self._hit_count,
+                'skipped_blocks': self._skipped_blocks,
+                'last_hit': {k: v.isoformat() for k, v in self._last_hit.items()},
+                'hit_history': [h.to_dict() for h in self._hit_history],
+            }
+            dir_path = os.path.dirname(self._storage_path)
+            if dir_path and not os.path.exists(dir_path):
+                os.makedirs(dir_path, exist_ok=True)
+            tmp_path = f"{self._storage_path}.tmp"
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, self._storage_path)
+            self._last_save = now
+            logger.debug(
+                f"Whitelist stats saved: {sum(self._hit_count.values())} total hits"
+            )
+        except Exception as e:
+            logger.error(f"Failed to save whitelist stats: {e}")
+
+    def _load(self):
+        if not self._storage_path or not os.path.exists(self._storage_path):
+            return
+        try:
+            with open(self._storage_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            self._hit_count = data.get('hit_count', {})
+            self._skipped_blocks = data.get('skipped_blocks', {})
+            for k, v in data.get('last_hit', {}).items():
+                try:
+                    self._last_hit[k] = datetime.fromisoformat(v)
+                except (ValueError, TypeError):
+                    continue
+            for hd in data.get('hit_history', []):
+                try:
+                    self._hit_history.append(WhitelistHit.from_dict(hd))
+                except Exception:
+                    continue
+            self._cleanup_old()
+            logger.info(
+                f"Loaded whitelist stats: {sum(self._hit_count.values())} hits, "
+                f"{len(self._hit_history)} history records from {self._storage_path}"
+            )
+        except Exception as e:
+            logger.error(f"Failed to load whitelist stats: {e}")
+
+    def _cleanup_old(self):
+        if self._max_history_days <= 0:
+            return
+        cutoff = datetime.now() - timedelta(days=self._max_history_days)
+        old_count = len(self._hit_history)
+        self._hit_history = [h for h in self._hit_history if h.timestamp >= cutoff]
+        removed = old_count - len(self._hit_history)
+        if removed > 0:
+            logger.debug(f"Cleaned up {removed} old whitelist hit records")
+
+    def flush(self):
+        self._save(force=True)
+
+    def print_whitelist_report(self, hours: Optional[int] = None, limit: int = 20):
+        if hours:
+            print(f"\n{'=' * 80}")
+            print(f"  白名单统计报告 / Whitelist Report - 最近 {hours} 小时")
+            print(f"{'=' * 80}")
         else:
-            for rid in self._hit_count:
-                self._hit_count[rid] = 0
-            self._last_hit.clear()
+            print(f"\n{'=' * 80}")
+            print(f"  白名单统计报告 / Whitelist Report - 全部历史")
+            print(f"{'=' * 80}")
+
+        print(f"\n📊 命中排行榜 / Top Hit Rules")
+        print(f"{'-' * 80}")
+        top_rules = self.get_top_rules(limit=limit, sort_by='hits')
+        if top_rules:
+            print(
+                f"  {'#':<3} {'规则ID':<18} {'名称':<22} {'命中':<6} "
+                f"{'跳过封禁':<8} {'IP数':<6} {'最近命中'}"
+            )
+            for i, s in enumerate(top_rules, 1):
+                last_hit = s['last_hit'].strftime('%m-%d %H:%M') if s['last_hit'] else 'never'
+                enabled = "✓" if s['enabled'] else "✗"
+                print(
+                    f"  {i:<3} [{enabled}] {s['name'][:20]:<20} "
+                    f"{s['hits']:<6} {s['skipped_blocks']:<8} "
+                    f"{s['ip_count']:<6} {last_hit}"
+                )
+                if s.get('description'):
+                    print(f"      说明: {s['description'][:60]}")
+        else:
+            print("  暂无命中数据")
+
+        recent_skips = self.get_hits(hours=hours, skipped_only=True)[:10]
+        if recent_skips:
+            print(f"\n⚠ 最近跳过的封禁 / Recently Skipped Blocks (Top 10)")
+            print(f"{'-' * 80}")
+            print(f"  {'时间':<18} {'规则':<18} {'源IP':<18} {'目标':<20} {'原因'}")
+            for h in recent_skips:
+                ts = h.timestamp.strftime('%m-%d %H:%M:%S')
+                dest = f"{h.dest_ip or '-'}:{h.dest_port or '-'}"
+                print(
+                    f"  {ts:<18} {h.rule_name[:16]:<18} "
+                    f"{h.source_ip or '-':<18} {dest[:19]:<20} {h.reason[:30]}"
+                )
+
+        total_hits = sum(self._hit_count.values())
+        total_skipped = sum(self._skipped_blocks.values())
+        unique_ips = len(set(h.source_ip for h in self._hit_history if h.source_ip))
+
+        print(f"\n📈 概览统计 / Overview")
+        print(f"{'-' * 80}")
+        print(f"  白名单规则总数: {len(self._rules)}")
+        print(f"  总命中次数: {total_hits}")
+        print(f"  跳过封禁次数: {total_skipped}")
+        print(f"  命中唯一IP数: {unique_ips}")
+        if hours:
+            recent_hits = len(self.get_hits(hours=hours))
+            recent_skipped = len(self.get_hits(hours=hours, skipped_only=True))
+            print(f"  最近{hours}h命中: {recent_hits} | 跳过封禁: {recent_skipped}")
+        print(f"{'=' * 80}\n")

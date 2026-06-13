@@ -183,34 +183,42 @@ class WindowsSecurityParser(BaseLogParser):
     ]
 
     SRC_PATTERNS = [
-        r'Source\s*Network\s*Address\s*[=:]\s*"?(\d{1,3}(?:\.\d{1,3}){3})"?',
-        r'SourceAddress\s*[=:]\s*"?(\d{1,3}(?:\.\d{1,3}){3})"?',
-        r'Source\s*Address\s*[=:]\s*"?(\d{1,3}(?:\.\d{1,3}){3})"?',
-        r'IpAddress\s*[=:]\s*"?(\d{1,3}(?:\.\d{1,3}){3})"?',
-        r'IP\s*Address\s*[=:]\s*"?(\d{1,3}(?:\.\d{1,3}){3})"?',
-        r'Remote(?:\s*Machine)?\s*Address\s*[=:]\s*"?(\d{1,3}(?:\.\d{1,3}){3})"?',
-        r'Remote\s*IP\s*[=:]\s*"?(\d{1,3}(?:\.\d{1,3}){3})"?',
-        r'Client\s*Address\s*[=:]\s*"?(\d{1,3}(?:\.\d{1,3}){3})"?',
-        r'<Data\s+Name=["\']SourceNetworkAddress["\']>(\d{1,3}(?:\.\d{1,3}){3})</Data>',
-        r'<Data\s+Name=["\']SourceAddress["\']>(\d{1,3}(?:\.\d{1,3}){3})</Data>',
-        r'<Data\s+Name=["\']IpAddress["\']>(\d{1,3}(?:\.\d{1,3}){3})</Data>',
-        r'<Data\s+Name=["\']RemoteAddress["\']>(\d{1,3}(?:\.\d{1,3}){3})</Data>',
-        r'<Data\s+Name=["\']ClientAddress["\']>(\d{1,3}(?:\.\d{1,3}){3})</Data>',
-        r'客户端地址\s*[=:]\s*"?(\d{1,3}(?:\.\d{1,3}){3})"?',
-        r'远程地址\s*[=:]\s*"?(\d{1,3}(?:\.\d{1,3}){3})"?',
+        r'Source\s*Network\s*Address\s*[=:]\s*"?([^"\s,]+)"?',
+        r'SourceAddress\s*[=:]\s*"?([^"\s,]+)"?',
+        r'Source\s*Address\s*[=:]\s*"?([^"\s,]+)"?',
+        r'Src(?:Addr)?\s*[=:]\s*"?([^"\s,]+)"?',
+        r'IpAddress\s*[=:]\s*"?([^"\s,]+)"?',
+        r'IP\s*Address\s*[=:]\s*"?([^"\s,]+)"?',
+        r'IP\s*[=:]\s*"?([^"\s,]+)"?',
+        r'Addr\s*[=:]\s*"?([^"\s,]+)"?',
+        r'Remote(?:\s*Machine)?\s*Address\s*[=:]\s*"?([^"\s,]+)"?',
+        r'Remote\s*IP\s*[=:]\s*"?([^"\s,]+)"?',
+        r'Client\s*Address\s*[=:]\s*"?([^"\s,]+)"?',
+        r'<Data\s+Name=["\']SourceNetworkAddress["\']>([^<]+)</Data>',
+        r'<Data\s+Name=["\']SourceAddress["\']>([^<]+)</Data>',
+        r'<Data\s+Name=["\']IpAddress["\']>([^<]+)</Data>',
+        r'<Data\s+Name=["\']RemoteAddress["\']>([^<]+)</Data>',
+        r'<Data\s+Name=["\']ClientAddress["\']>([^<]+)</Data>',
+        r'客户端地址\s*[=:]\s*"?([^"\s,]+)"?',
+        r'远程地址\s*[=:]\s*"?([^"\s,]+)"?',
+        r'来源地址\s*[=:]\s*"?([^"\s,]+)"?',
+        r'Src\s*[=:]\s*"?([^"\s,]+)"?',
     ]
 
     DST_PATTERNS = [
-        r'Destination\s*Network\s*Address\s*[=:]\s*"?(\d{1,3}(?:\.\d{1,3}){3})"?',
-        r'DestAddress\s*[=:]\s*"?(\d{1,3}(?:\.\d{1,3}){3})"?',
-        r'Destination\s*Address\s*[=:]\s*"?(\d{1,3}(?:\.\d{1,3}){3})"?',
-        r'Dest(?:ination)?\s*IP\s*[=:]\s*"?(\d{1,3}(?:\.\d{1,3}){3})"?',
-        r'Local\s*Address\s*[=:]\s*"?(\d{1,3}(?:\.\d{1,3}){3})"?',
-        r'<Data\s+Name=["\']DestAddress["\']>(\d{1,3}(?:\.\d{1,3}){3})</Data>',
-        r'<Data\s+Name=["\']DestinationAddress["\']>(\d{1,3}(?:\.\d{1,3}){3})</Data>',
-        r'<Data\s+Name=["\']LocalAddress["\']>(\d{1,3}(?:\.\d{1,3}){3})</Data>',
-        r'目标地址\s*[=:]\s*"?(\d{1,3}(?:\.\d{1,3}){3})"?',
-        r'本地地址\s*[=:]\s*"?(\d{1,3}(?:\.\d{1,3}){3})"?',
+        r'Destination\s*Network\s*Address\s*[=:]\s*"?([^"\s,]+)"?',
+        r'DestAddress\s*[=:]\s*"?([^"\s,]+)"?',
+        r'Destination\s*Address\s*[=:]\s*"?([^"\s,]+)"?',
+        r'Dest(?:Addr)?\s*[=:]\s*"?([^"\s,]+)"?',
+        r'Dest(?:ination)?\s*IP\s*[=:]\s*"?([^"\s,]+)"?',
+        r'Local\s*Address\s*[=:]\s*"?([^"\s,]+)"?',
+        r'Dst\s*[=:]\s*"?([^"\s,]+)"?',
+        r'Target\s*Address\s*[=:]\s*"?([^"\s,]+)"?',
+        r'<Data\s+Name=["\']DestAddress["\']>([^<]+)</Data>',
+        r'<Data\s+Name=["\']DestinationAddress["\']>([^<]+)</Data>',
+        r'<Data\s+Name=["\']LocalAddress["\']>([^<]+)</Data>',
+        r'目标地址\s*[=:]\s*"?([^"\s,]+)"?',
+        r'本地地址\s*[=:]\s*"?([^"\s,]+)"?',
     ]
 
     DPT_PATTERNS = [
@@ -370,10 +378,25 @@ class WindowsSecurityParser(BaseLogParser):
         if keywords:
             entry.extra['keywords'] = keywords.strip()
 
-        entry.source_ip = self._search_field(line, self.SRC_PATTERNS)
-        entry.dest_ip = self._search_field(line, self.DST_PATTERNS)
+        entry.source_ip = self._normalize_ip(self._search_field(line, self.SRC_PATTERNS))
+        entry.dest_ip = self._normalize_ip(self._search_field(line, self.DST_PATTERNS))
         entry.source_port = self._search_int(line, self.SPT_PATTERNS)
         entry.dest_port = self._search_int(line, self.DPT_PATTERNS)
+
+        if not entry.source_ip or not entry.dest_ip:
+            ip_candidates = self._extract_all_ips(line)
+            if len(ip_candidates) >= 2:
+                if not entry.source_ip:
+                    entry.source_ip = self._normalize_ip(ip_candidates[0])
+                if not entry.dest_ip:
+                    entry.dest_ip = self._normalize_ip(ip_candidates[-1])
+            elif len(ip_candidates) == 1 and not entry.source_ip and not entry.dest_ip:
+                entry.source_ip = self._normalize_ip(ip_candidates[0])
+
+        if entry.source_ip:
+            entry.extra['source_ip_raw'] = entry.source_ip
+        if entry.dest_ip:
+            entry.extra['dest_ip_raw'] = entry.dest_ip
 
         proto = self._search_field(line, self.PROTO_PATTERNS)
         if proto:
@@ -393,6 +416,46 @@ class WindowsSecurityParser(BaseLogParser):
         if entry.source_ip or entry.dest_ip or entry.action:
             return entry
         return None
+
+    @staticmethod
+    def _normalize_ip(ip_str: Optional[str]) -> Optional[str]:
+        if not ip_str:
+            return None
+        ip_str = ip_str.strip()
+        if not ip_str:
+            return None
+
+        if ip_str.startswith('::ffff:') or ip_str.startswith('::FFFF:'):
+            mapped = ip_str.split(':', 1)[1].lstrip(':fF')
+            mapped = mapped.lstrip('fF:')
+            if mapped and re.match(r'^\d{1,3}(?:\.\d{1,3}){3}$', mapped):
+                return mapped
+
+        ipv4_match = re.search(r'(\d{1,3}(?:\.\d{1,3}){3})', ip_str)
+        if ipv4_match:
+            return ipv4_match.group(1)
+
+        if ':' in ip_str:
+            if re.match(r'^[0-9a-fA-F:]+$', ip_str):
+                if '.' in ip_str:
+                    last_part = ip_str.rsplit(':', 1)[-1]
+                    if re.match(r'^\d{1,3}(?:\.\d{1,3}){3}$', last_part):
+                        return last_part
+                return ip_str
+
+        return ip_str if re.match(r'^\d{1,3}(?:\.\d{1,3}){3}$', ip_str) else None
+
+    @staticmethod
+    def _extract_all_ips(line: str) -> list[str]:
+        ips = []
+        pattern = r'(?:::f{4}:)?(\d{1,3}(?:\.\d{1,3}){3})'
+        for m in re.finditer(pattern, line):
+            ip = m.group(1)
+            parts = ip.split('.')
+            if all(0 <= int(p) <= 255 for p in parts):
+                if ip not in ips:
+                    ips.append(ip)
+        return ips
 
     def _extract_timestamp(self, line: str) -> datetime:
         for pattern in self.TIMESTAMP_PATTERNS:

@@ -1,4 +1,5 @@
 import re
+import os
 import logging
 import logging.handlers
 import signal
@@ -13,6 +14,7 @@ from .log_monitor import MultiLogMonitor, LogMonitor
 from .rule_engine import RuleEngine, Rule, RuleActionContext
 from .blacklist_manager import BlacklistManager, BlacklistEntry
 from .whitelist_manager import WhitelistManager, WhitelistMatch
+from .audit_logger import AuditLogger
 
 logger = logging.getLogger("firewall_analyzer")
 
@@ -31,7 +33,6 @@ def setup_logging(config: AppConfig):
     handlers.append(console_handler)
 
     if config.log_file:
-        import os
         log_dir = os.path.dirname(config.log_file)
         if log_dir and not os.path.exists(log_dir):
             os.makedirs(log_dir, exist_ok=True)
@@ -69,7 +70,33 @@ class FirewallAnalyzer:
             sync_interval_seconds=config.blacklist.sync_interval_seconds,
             strict_consistency=config.blacklist.strict_consistency,
         )
-        self.whitelist = WhitelistManager()
+
+        whitelist_storage = None
+        if config.whitelist.enabled and config.extra.get('whitelist_storage_path'):
+            whitelist_storage = config.extra['whitelist_storage_path']
+        elif config.blacklist.storage_path:
+            base_dir = os.path.dirname(config.blacklist.storage_path)
+            if base_dir:
+                whitelist_storage = os.path.join(base_dir, 'whitelist_stats.json')
+
+        self.whitelist = WhitelistManager(
+            storage_path=whitelist_storage,
+            max_history_days=config.extra.get('whitelist_max_history_days', 30),
+        )
+
+        audit_storage = None
+        if config.extra.get('audit_storage_path'):
+            audit_storage = config.extra['audit_storage_path']
+        elif config.blacklist.storage_path:
+            base_dir = os.path.dirname(config.blacklist.storage_path)
+            if base_dir:
+                audit_storage = os.path.join(base_dir, 'audit_log.json')
+
+        self.audit = AuditLogger(
+            storage_path=audit_storage,
+            max_history_days=config.extra.get('audit_max_history_days', 30),
+        )
+
         self.rule_engine = RuleEngine()
         self._monitor: Optional[MultiLogMonitor] = None
         self._stop_event = threading.Event()
@@ -93,11 +120,26 @@ class FirewallAnalyzer:
         def on_block(entry: BlacklistEntry):
             with self._stats_lock:
                 self._stats['ips_blocked'] += 1
+
+            stage = entry.extra.get('stage', '') if entry.extra else ''
+            stage_label = entry.extra.get('stage_label', '') if entry.extra else ''
+            stage_msg = f" | stage={stage_label or stage}" if stage else ''
+
             logger.warning(
                 f"[BLACKLIST] + {entry.ip_address} "
                 f"| reason: {entry.reason or 'N/A'} "
                 f"| rule: {entry.rule_id or 'N/A'} "
                 f"| expire: {entry.expire_at.isoformat() if entry.expire_at else 'never'}"
+                f"{stage_msg}"
+            )
+
+            self.audit.log_block(
+                ip_address=entry.ip_address,
+                reason=entry.reason or '',
+                rule_id=entry.rule_id or '',
+                stage=stage_label or stage,
+                expire_at=entry.expire_at,
+                extra=entry.extra or {},
             )
 
         def on_unblock(entry: BlacklistEntry):
@@ -105,6 +147,7 @@ class FirewallAnalyzer:
                 f"[BLACKLIST] - {entry.ip_address} "
                 f"| was blocked for {entry.reason or 'N/A'}"
             )
+            self.audit.log_unblock(entry.ip_address, reason='expired or manual')
 
         self.blacklist.on_block(on_block)
         self.blacklist.on_unblock(on_unblock)
@@ -147,17 +190,29 @@ class FirewallAnalyzer:
             if self.blacklist.is_blocked(context.ip_address):
                 return
 
+            stage = context.extra.get('stage', '')
+            stage_label = context.extra.get('stage_label', '')
+
             reason = context.extra.get('reason', context.rule_name)
+            if stage_label:
+                reason = f"[{stage_label}] {reason}"
+
             expire_hours = context.extra.get('expire_hours', context.extra.get('auto_unblock_hours'))
+
+            block_extra = {
+                'trigger_count': context.count,
+                'time_window': context.time_window,
+                'stage': stage,
+                'stage_label': stage_label,
+                'escalated': context.extra.get('escalated', False),
+            }
+
             self.blacklist.block_ip(
                 ip=context.ip_address,
                 reason=reason,
                 rule_id=context.rule_id,
                 expire_hours=expire_hours,
-                extra={
-                    'trigger_count': context.count,
-                    'time_window': context.time_window,
-                },
+                extra=block_extra,
             )
 
         def unblock_action(context: RuleActionContext):
@@ -257,11 +312,38 @@ class FirewallAnalyzer:
         def on_rule_triggered(rule: Rule, context: RuleActionContext):
             with self._stats_lock:
                 self._stats['rules_triggered'] += 1
-            logger.info(
+
+            stage = context.extra.get('stage', '')
+            stage_label = context.extra.get('stage_label', '')
+            escalated = context.extra.get('escalated', False)
+
+            stage_msg = ''
+            if stage_label:
+                stage_msg = f" | Stage={stage_label}({stage})" + (" [ESCALATED]" if escalated else "")
+
+            logger.warning(
                 f"[RULE TRIGGER] {rule.id} ({rule.name}) "
                 f"| IP: {context.ip_address} "
                 f"| Count: {context.count}/{rule.threshold} "
                 f"| Window: {rule.time_window}s"
+                f"{stage_msg}"
+            )
+
+            executed_actions = context.extra.get('executed_actions', [])
+            self.audit.log_alert(
+                rule_id=rule.id,
+                rule_name=rule.name,
+                ip_address=context.ip_address,
+                count=context.count,
+                time_window=rule.time_window,
+                action=','.join(executed_actions),
+                action_result='triggered',
+                stage=stage_label or (str(stage) if stage else ''),
+                extra={
+                    'threshold': rule.threshold,
+                    'escalated': escalated,
+                    'executed_actions': executed_actions,
+                },
             )
 
         self.rule_engine.on_trigger(on_rule_triggered)
@@ -476,6 +558,36 @@ def main():
         default=None,
         help='手动拉黑的过期时间(小时) / Expire hours for manual block',
     )
+    parser.add_argument(
+        '--audit',
+        action='store_true',
+        help='显示完整告警审计报告 / Show full audit report',
+    )
+    parser.add_argument(
+        '--audit-1h',
+        action='store_true',
+        help='显示最近1小时告警审计报告 / Show last 1 hour audit report',
+    )
+    parser.add_argument(
+        '--audit-24h',
+        action='store_true',
+        help='显示最近24小时告警审计报告 / Show last 24 hours audit report',
+    )
+    parser.add_argument(
+        '--whitelist-stats',
+        action='store_true',
+        help='显示白名单统计报告 / Show whitelist statistics report',
+    )
+    parser.add_argument(
+        '--whitelist-stats-1h',
+        action='store_true',
+        help='显示最近1小时白名单统计 / Show last 1 hour whitelist stats',
+    )
+    parser.add_argument(
+        '--whitelist-stats-24h',
+        action='store_true',
+        help='显示最近24小时白名单统计 / Show last 24 hours whitelist stats',
+    )
 
     args = parser.parse_args()
 
@@ -516,6 +628,30 @@ def main():
             if rule.actions:
                 print(f"        动作: {', '.join(a.get('type', a.get('action', '?')) for a in rule.actions)}")
             print()
+        sys.exit(0)
+
+    if args.audit_1h:
+        analyzer.audit.print_audit_report(hours=1)
+        sys.exit(0)
+
+    if args.audit_24h:
+        analyzer.audit.print_audit_report(hours=24)
+        sys.exit(0)
+
+    if args.audit:
+        analyzer.audit.print_audit_report(hours=None)
+        sys.exit(0)
+
+    if args.whitelist_stats_1h:
+        analyzer.whitelist.print_whitelist_report(hours=1)
+        sys.exit(0)
+
+    if args.whitelist_stats_24h:
+        analyzer.whitelist.print_whitelist_report(hours=24)
+        sys.exit(0)
+
+    if args.whitelist_stats:
+        analyzer.whitelist.print_whitelist_report(hours=None)
         sys.exit(0)
 
     if args.show_blacklist:

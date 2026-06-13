@@ -28,6 +28,12 @@ blacklist:
   sync_interval_seconds: 300
   strict_consistency: true
 
+extra:
+  audit_storage_path: data/audit_log.json
+  audit_max_history_days: 90
+  whitelist_storage_path: data/whitelist_stats.json
+  whitelist_max_history_days: 60
+
 whitelist:
   enabled: true
   rules:
@@ -133,7 +139,7 @@ rules:
 
   - id: windows_login_fail
     name: Windows Failed Login
-    description: Windows 4625事件10分钟内5次失败则拉黑
+    description: Windows 4625事件 - 支持分级阶段：告警→临时封→延长封禁
     enabled: true
 
     conditions:
@@ -147,21 +153,61 @@ rules:
         operator: not_in_cidr
         value: 192.168.0.0/16
 
-    threshold: 5
-    time_window: 600
+    threshold: 3
+    time_window: 300
     group_by: source_ip
-    cooldown: 600
-    auto_unblock_hours: 12
+    cooldown: 120
+    stage_cooldown_minutes: 120
+
+    stages:
+      - stage: 1
+        label: Warning
+        description: 初次告警，只记录日志
+        min_triggers: 1
+        within_minutes: 30
+        actions:
+          - type: log
+            level: WARNING
+            message: "[STAGE 1] Failed login attempts from {IP} - monitoring"
+          - type: webhook
+            url: https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK
+            payload:
+              text: ':warning: Stage 1 alert: {IP} has {COUNT} failed Windows logins'
+
+      - stage: 2
+        label: Temporary Block
+        description: 继续违规，临时封禁10分钟
+        min_triggers: 2
+        within_minutes: 30
+        actions:
+          - type: block
+            reason: Repeated failed logins (Stage 2)
+            expire_hours: 0.17
+          - type: log
+            level: WARNING
+            message: "[STAGE 2] {IP} temporarily blocked for 10 minutes"
+
+      - stage: 3
+        label: Extended Block
+        description: 持续攻击，延长封禁24小时
+        min_triggers: 4
+        within_minutes: 60
+        actions:
+          - type: block
+            reason: Persistent brute force attack (Stage 3)
+            expire_hours: 24
+          - type: webhook
+            url: https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK
+            payload:
+              text: ':red_circle: STAGE 3 BLOCK: {IP} blocked for 24h after {COUNT} failed attempts'
+          - type: log
+            level: CRITICAL
+            message: "[STAGE 3] {IP} blocked for 24 hours due to persistent attack"
 
     actions:
-      - type: block
-        reason: Windows Brute Force Login
-
-      - type: webhook
-        url: https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK
-        method: POST
-        payload:
-          text: 'Security Alert: {IP} has been blocked for {COUNT} failed Windows login attempts'
+      - type: log
+        level: INFO
+        message: "Windows login fail from {IP} (stage={STAGE} {STAGE_LABEL})"
 
   - id: port_scan
     name: Port Scan Detection
