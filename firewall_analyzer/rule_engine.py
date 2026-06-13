@@ -1,12 +1,21 @@
 import re
 import time
+import json
 import logging
 import ipaddress
+import threading
 from collections import deque, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Callable, Optional, Union
 from abc import ABC, abstractmethod
+
+try:
+    import urllib.request
+    import urllib.parse
+    HAS_URLLIB = True
+except ImportError:
+    HAS_URLLIB = False
 
 from .log_parser import LogEntry
 
@@ -32,6 +41,144 @@ class RuleActionContext:
     extra: dict[str, Any] = field(default_factory=dict)
 
 
+def _is_private_ip(ip_str: str) -> bool:
+    if not ip_str:
+        return False
+    try:
+        ip = ipaddress.ip_address(ip_str)
+        return ip.is_private
+    except ValueError:
+        return False
+
+
+def _is_public_ip(ip_str: str) -> bool:
+    if not ip_str:
+        return False
+    try:
+        ip = ipaddress.ip_address(ip_str)
+        return not (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast)
+    except ValueError:
+        return False
+
+
+def _in_cidr(ip_str: str, cidr: str) -> bool:
+    if not ip_str or not cidr:
+        return False
+    try:
+        ip = ipaddress.ip_address(ip_str)
+        network = ipaddress.ip_network(cidr, strict=False)
+        return ip in network
+    except ValueError:
+        return False
+
+
+def _in_cidr_list(ip_str: str, cidr_list: Union[str, list]) -> bool:
+    if not ip_str or not cidr_list:
+        return False
+    if isinstance(cidr_list, str):
+        cidr_list = [c.strip() for c in cidr_list.split(',') if c.strip()]
+    for cidr in cidr_list:
+        if _in_cidr(ip_str, cidr):
+            return True
+    return False
+
+
+def _in_port_range(port: Union[int, str, None], range_spec: Union[str, list, tuple]) -> bool:
+    if port is None:
+        return False
+    try:
+        port = int(port)
+    except (ValueError, TypeError):
+        return False
+
+    if isinstance(range_spec, str):
+        if '-' in range_spec:
+            start, end = range_spec.split('-', 1)
+            try:
+                return int(start.strip()) <= port <= int(end.strip())
+            except (ValueError, TypeError):
+                return False
+        else:
+            try:
+                return port == int(range_spec)
+            except (ValueError, TypeError):
+                return False
+    elif isinstance(range_spec, (list, tuple)):
+        if len(range_spec) == 2 and all(isinstance(x, (int, str)) for x in range_spec):
+            try:
+                return int(range_spec[0]) <= port <= int(range_spec[1])
+            except (ValueError, TypeError):
+                return False
+        else:
+            return any(_in_port_range(port, r) for r in range_spec)
+
+    return False
+
+
+def _in_time_range(_, time_spec: Union[str, list]) -> bool:
+    now = datetime.now()
+
+    if isinstance(time_spec, str):
+        time_specs = [time_spec]
+    else:
+        time_specs = list(time_spec)
+
+    for spec in time_specs:
+        try:
+            if '-' in spec:
+                start_str, end_str = spec.split('-', 1)
+                start_h, start_m = _parse_hhmm(start_str.strip())
+                end_h, end_m = _parse_hhmm(end_str.strip())
+
+                current_minutes = now.hour * 60 + now.minute
+                start_minutes = start_h * 60 + start_m
+                end_minutes = end_h * 60 + end_m
+
+                if start_minutes <= end_minutes:
+                    if start_minutes <= current_minutes <= end_minutes:
+                        return True
+                else:
+                    if current_minutes >= start_minutes or current_minutes <= end_minutes:
+                        return True
+        except (ValueError, TypeError):
+            continue
+
+    return False
+
+
+def _is_day_of_week(_, days: Union[int, str, list]) -> bool:
+    now = datetime.now()
+    today = now.weekday()
+
+    if isinstance(days, (int, str)):
+        days_list = [int(d) for d in str(days).split(',') if d.strip().isdigit()]
+    else:
+        days_list = [int(d) for d in days if str(d).strip().isdigit()]
+
+    return today in days_list
+
+
+def _is_hour_of_day(_, hours: Union[int, str, list]) -> bool:
+    now = datetime.now()
+    current_hour = now.hour
+
+    if isinstance(hours, (int, str)):
+        hours_list = [int(h) for h in str(hours).split(',') if h.strip().isdigit()]
+    else:
+        hours_list = [int(h) for h in hours if str(h).strip().isdigit()]
+
+    return current_hour in hours_list
+
+
+def _parse_hhmm(s: str) -> tuple[int, int]:
+    s = s.strip()
+    if ':' in s:
+        h, m = s.split(':', 1)
+        return int(h.strip()), int(m.strip())
+    else:
+        return int(s), 0
+
+
 class ConditionEvaluator:
     OPERATORS = {
         'eq': lambda a, b: a == b,
@@ -49,6 +196,14 @@ class ConditionEvaluator:
         'endswith': lambda a, b: str(a).endswith(str(b)) if a and b else False,
         'is_private_ip': lambda a, b: _is_private_ip(a),
         'is_public_ip': lambda a, b: _is_public_ip(a),
+        'in_cidr': lambda a, b: _in_cidr_list(a, b),
+        'not_in_cidr': lambda a, b: not _in_cidr_list(a, b),
+        'in_port_range': lambda a, b: _in_port_range(a, b),
+        'not_in_port_range': lambda a, b: not _in_port_range(a, b),
+        'in_time_range': _in_time_range,
+        'not_in_time_range': lambda a, b: not _in_time_range(a, b),
+        'is_day_of_week': _is_day_of_week,
+        'is_hour_of_day': _is_hour_of_day,
     }
 
     def __init__(self, conditions: list[dict]):
@@ -82,6 +237,9 @@ class ConditionEvaluator:
             return False
 
     def _get_field_value(self, entry: LogEntry, field_path: str) -> Any:
+        if not field_path:
+            return None
+
         parts = field_path.split('.')
         obj: Any = entry
         for part in parts:
@@ -92,26 +250,6 @@ class ConditionEvaluator:
             else:
                 obj = getattr(obj, part, None)
         return obj
-
-
-def _is_private_ip(ip_str: str) -> bool:
-    if not ip_str:
-        return False
-    try:
-        ip = ipaddress.ip_address(ip_str)
-        return ip.is_private
-    except ValueError:
-        return False
-
-
-def _is_public_ip(ip_str: str) -> bool:
-    if not ip_str:
-        return False
-    try:
-        ip = ipaddress.ip_address(ip_str)
-        return not (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast)
-    except ValueError:
-        return False
 
 
 class EventTracker:
@@ -273,6 +411,7 @@ class Rule:
     cooldown: int = 0
     burst_threshold: Optional[int] = None
     burst_window: int = 10
+    auto_unblock_hours: Optional[float] = None
     actions: list[dict] = field(default_factory=list)
 
     @classmethod
@@ -289,6 +428,7 @@ class Rule:
             cooldown=data.get('cooldown', 0),
             burst_threshold=data.get('burst_threshold'),
             burst_window=data.get('burst_window', 10),
+            auto_unblock_hours=data.get('auto_unblock_hours'),
             actions=data.get('actions', []),
         )
 
@@ -309,6 +449,7 @@ class RuleEngine:
 
     def _register_default_handlers(self):
         self.register_action_handler('log', self._default_log_action)
+        self.register_action_handler('webhook', send_webhook_action)
 
     def add_rule(self, rule: Rule):
         if not rule.id:
@@ -393,16 +534,24 @@ class RuleEngine:
             f"key={key} | count={count} | threshold={rule.threshold}"
         )
 
+        ip_address = None
+        if key:
+            if ':' in key:
+                ip_address = key.split(':')[0]
+            else:
+                ip_address = key
+
         context = RuleActionContext(
             rule_id=rule.id,
             rule_name=rule.name,
-            ip_address=key if key and ':' not in key else (key.split(':')[0] if key else None),
+            ip_address=ip_address,
             entries=entries,
             count=count,
             time_window=rule.time_window,
             extra={
                 'key': key,
                 'threshold': rule.threshold,
+                'auto_unblock_hours': rule.auto_unblock_hours,
             },
         )
 
@@ -436,3 +585,77 @@ class RuleEngine:
             f"window={context.time_window}s | "
             f"entries={len(context.entries)}"
         )
+
+
+def send_webhook(url: str, payload: dict, method: str = "POST",
+                headers: Optional[dict] = None, timeout: int = 10) -> tuple[int, str]:
+    if not HAS_URLLIB:
+        return -1, "urllib not available"
+
+    try:
+        json_data = json.dumps(payload).encode('utf-8')
+        req_headers = {
+            'Content-Type': 'application/json',
+            **(headers or {}),
+        }
+        req = urllib.request.Request(
+            url=url,
+            data=json_data,
+            headers=req_headers,
+            method=method.upper(),
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            response_body = response.read().decode('utf-8', errors='replace')
+            return response.status, response_body
+    except Exception as e:
+        logger.error(f"Webhook request failed to {url}: {e}")
+        return -1, str(e)
+
+
+def send_webhook_action(context: RuleActionContext):
+    url = context.extra.get('url')
+    if not url:
+        logger.warning("[ACTION:WEBHOOK] Missing 'url' parameter in webhook action")
+        return
+
+    method = context.extra.get('method', 'POST')
+    headers = context.extra.get('headers', {})
+    timeout = context.extra.get('timeout', 10)
+    template = context.extra.get('payload')
+
+    if template:
+        payload = dict(template)
+        for k, v in payload.items():
+            if isinstance(v, str):
+                v = v.replace('{IP}', context.ip_address or '')
+                v = v.replace('{RULE_ID}', context.rule_id)
+                v = v.replace('{RULE_NAME}', context.rule_name)
+                v = v.replace('{COUNT}', str(context.count))
+                v = v.replace('{TIME_WINDOW}', str(context.time_window))
+                payload[k] = v
+    else:
+        payload = {
+            'event': 'firewall_rule_triggered',
+            'rule_id': context.rule_id,
+            'rule_name': context.rule_name,
+            'ip_address': context.ip_address,
+            'count': context.count,
+            'time_window': context.time_window,
+            'timestamp': datetime.now().isoformat(),
+            'source_ips': list(set(e.source_ip for e in context.entries if e.source_ip))[:20],
+            'sample_logs': [e.raw_line for e in context.entries[:5]],
+        }
+
+    status, response = send_webhook(url, payload, method=method, headers=headers, timeout=timeout)
+
+    if status >= 200 and status < 300:
+        logger.info(
+            f"[ACTION:WEBHOOK] Successfully sent to {url} | "
+            f"status={status} | ip={context.ip_address}"
+        )
+    else:
+        logger.warning(
+            f"[ACTION:WEBHOOK] Failed to send to {url} | "
+            f"status={status} | response={response[:200]}"
+        )
+

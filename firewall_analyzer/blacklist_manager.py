@@ -5,6 +5,7 @@ import time
 import shlex
 import socket
 import struct
+import threading
 import ipaddress
 import platform
 import logging
@@ -324,13 +325,32 @@ class BlacklistManager:
         storage_path: Optional[str] = None,
         auto_save: bool = True,
         default_expire_hours: Optional[int] = None,
+        auto_sync: bool = True,
+        sync_interval_seconds: int = 300,
+        strict_consistency: bool = True,
     ):
         self.storage_path = storage_path
         self.auto_save = auto_save
         self.default_expire_hours = default_expire_hours
+        self.auto_sync = auto_sync
+        self.sync_interval = sync_interval_seconds
+        self.strict_consistency = strict_consistency
+
         self._entries: dict[str, BlacklistEntry] = {}
         self._on_block_callbacks: list[Callable[[BlacklistEntry], None]] = []
         self._on_unblock_callbacks: list[Callable[[BlacklistEntry], None]] = []
+        self._last_sync = 0.0
+        self._sync_lock = threading.Lock()
+        self._stats = {
+            'block_attempts': 0,
+            'block_success': 0,
+            'block_failed': 0,
+            'unblock_attempts': 0,
+            'unblock_success': 0,
+            'unblock_failed': 0,
+            'sync_count': 0,
+            'inconsistencies_found': 0,
+        }
 
         system = platform.system().lower()
         if system == 'linux':
@@ -343,12 +363,21 @@ class BlacklistManager:
 
         if storage_path and os.path.exists(storage_path):
             self._load()
+            if self.strict_consistency:
+                self.sync_with_system(save=False)
 
     def on_block(self, callback: Callable[[BlacklistEntry], None]):
         self._on_block_callbacks.append(callback)
 
     def on_unblock(self, callback: Callable[[BlacklistEntry], None]):
         self._on_unblock_callbacks.append(callback)
+
+    def _check_in_blacklist(self, ip: str) -> bool:
+        try:
+            return self.firewall.is_ip_blocked(ip)
+        except Exception as e:
+            logger.error(f"Error checking system block status for {ip}: {e}")
+            return ip in self._entries
 
     def block_ip(
         self,
@@ -362,20 +391,50 @@ class BlacklistManager:
             logger.error(f"Invalid IP address: {ip}")
             return False
 
+        self._stats['block_attempts'] += 1
+
+        if self.strict_consistency and self._check_in_blacklist(ip):
+            logger.info(f"IP {ip} is already blocked at system level")
+            existing = self._entries.get(ip)
+            if existing:
+                existing.hits += 1
+                existing.added_at = datetime.now()
+                existing.reason = reason or existing.reason
+                existing.rule_id = rule_id or existing.rule_id
+                if extra:
+                    existing.extra.update(extra)
+                if self.auto_save:
+                    self._save()
+                self._stats['block_success'] += 1
+                return True
+
+        comment = f"{rule_id}: {reason}".strip(": ")
+        logger.debug(f"[BLOCK-ATTEMPT] Executing system command to block {ip}...")
+        success = self.firewall.block_ip(ip, comment=comment)
+
+        if not success:
+            self._stats['block_failed'] += 1
+            logger.error(
+                f"[BLOCK-FAILED] System command failed for IP {ip}. "
+                f"Not adding to internal blacklist to maintain consistency."
+            )
+            return False
+
+        expire_at = None
+        expire_h = expire_hours if expire_hours is not None else self.default_expire_hours
+        if expire_h:
+            expire_at = datetime.now() + timedelta(hours=expire_h)
+
         if ip in self._entries:
             entry = self._entries[ip]
             entry.hits += 1
             entry.added_at = datetime.now()
             entry.reason = reason or entry.reason
             entry.rule_id = rule_id or entry.rule_id
+            entry.expire_at = expire_at
             if extra:
                 entry.extra.update(extra)
         else:
-            expire_at = None
-            expire_h = expire_hours if expire_hours is not None else self.default_expire_hours
-            if expire_h:
-                expire_at = datetime.now() + timedelta(hours=expire_h)
-
             entry = BlacklistEntry(
                 ip_address=ip,
                 added_at=datetime.now(),
@@ -386,56 +445,196 @@ class BlacklistManager:
             )
             self._entries[ip] = entry
 
-        comment = f"{rule_id}: {reason}".strip(": ")
-        success = self.firewall.block_ip(ip, comment=comment)
+        self._stats['block_success'] += 1
 
-        if success:
+        if self.strict_consistency and not self._check_in_blacklist(ip):
             logger.warning(
-                f"IP BLOCKED: {ip} | reason: {reason or 'N/A'} | "
-                f"rule: {rule_id or 'N/A'} | "
-                f"expires: {entry.expire_at.isoformat() if entry.expire_at else 'never'}"
+                f"[INCONSISTENCY] System reports IP {ip} is NOT blocked, "
+                f"but our command said it succeeded. Removing from internal list."
             )
-            for cb in self._on_block_callbacks:
-                try:
-                    cb(entry)
-                except Exception as e:
-                    logger.error(f"Error in block callback: {e}")
+            self._entries.pop(ip, None)
+            self._stats['block_success'] -= 1
+            self._stats['block_failed'] += 1
+            self._stats['inconsistencies_found'] += 1
+            return False
 
-            if self.auto_save:
-                self._save()
+        logger.warning(
+            f"[BLOCK-SUCCESS] {ip} | reason: {reason or 'N/A'} | "
+            f"rule: {rule_id or 'N/A'} | "
+            f"expires: {entry.expire_at.isoformat() if entry.expire_at else 'never'}"
+        )
 
-        return success
-
-    def unblock_ip(self, ip: str) -> bool:
-        if ip not in self._entries:
-            logger.debug(f"IP {ip} not in blacklist")
-            return self.firewall.unblock_ip(ip)
-
-        entry = self._entries.pop(ip)
-        success = self.firewall.unblock_ip(ip)
-
-        logger.info(f"IP UNBLOCKED: {ip} | was blocked at: {entry.added_at.isoformat()}")
-
-        for cb in self._on_unblock_callbacks:
+        for cb in self._on_block_callbacks:
             try:
                 cb(entry)
             except Exception as e:
-                logger.error(f"Error in unblock callback: {e}")
+                logger.error(f"Error in block callback: {e}")
 
         if self.auto_save:
             self._save()
 
-        return success
+        return True
+
+    def unblock_ip(self, ip: str) -> bool:
+        if not self._validate_ip(ip):
+            logger.error(f"Invalid IP address: {ip}")
+            return False
+
+        self._stats['unblock_attempts'] += 1
+        in_internal = ip in self._entries
+        in_system = self._check_in_blacklist(ip)
+
+        if not in_internal and not in_system:
+            logger.debug(f"IP {ip} not blocked in internal list or system")
+            return True
+
+        entry = self._entries.get(ip)
+
+        logger.debug(f"[UNBLOCK-ATTEMPT] Executing system command to unblock {ip}...")
+        system_success = self.firewall.unblock_ip(ip)
+
+        if self.strict_consistency and not system_success and in_system:
+            self._stats['unblock_failed'] += 1
+            logger.error(
+                f"[UNBLOCK-FAILED] System command failed for IP {ip}. "
+                f"Keeping in internal list to maintain consistency."
+            )
+            return False
+
+        if self.strict_consistency and self._check_in_blacklist(ip):
+            self._stats['unblock_failed'] += 1
+            logger.warning(
+                f"[INCONSISTENCY] System still reports IP {ip} is blocked. "
+                f"Not removing from internal list."
+            )
+            self._stats['inconsistencies_found'] += 1
+            return False
+
+        if ip in self._entries:
+            self._entries.pop(ip)
+
+        self._stats['unblock_success'] += 1
+
+        if entry:
+            logger.info(
+                f"[UNBLOCK-SUCCESS] {ip} | was blocked at: {entry.added_at.isoformat()} | "
+                f"reason: {entry.reason or 'N/A'}"
+            )
+
+            for cb in self._on_unblock_callbacks:
+                try:
+                    cb(entry)
+                except Exception as e:
+                    logger.error(f"Error in unblock callback: {e}")
+
+        if self.auto_save:
+            self._save()
+
+        return True
 
     def is_blocked(self, ip: str) -> bool:
+        if self.auto_sync and (time.time() - self._last_sync) > self.sync_interval:
+            self.sync_with_system(save=True)
+
         if ip in self._entries:
             entry = self._entries[ip]
             if entry.is_expired:
                 logger.debug(f"IP {ip} blacklist entry expired, removing...")
                 self.unblock_ip(ip)
                 return False
+
+            if self.strict_consistency:
+                if not self._check_in_blacklist(ip):
+                    logger.warning(
+                        f"[INCONSISTENCY] IP {ip} in internal list but not blocked at system level. "
+                        f"Removing from internal list."
+                    )
+                    self._entries.pop(ip, None)
+                    self._stats['inconsistencies_found'] += 1
+                    if self.auto_save:
+                        self._save()
+                    return False
             return True
+
         return False
+
+    def sync_with_system(self, save: bool = True) -> dict:
+        with self._sync_lock:
+            self._last_sync = time.time()
+            self._stats['sync_count'] += 1
+
+            result = {
+                'added_to_internal': [],
+                'removed_from_internal': [],
+                'added_to_system': [],
+                'system_blocked': [],
+                'internal_blocked': list(self._entries.keys()),
+            }
+
+            try:
+                system_blocked = set(self.firewall.list_blocked_ips())
+                result['system_blocked'] = list(system_blocked)
+            except Exception as e:
+                logger.error(f"Error getting system blocked IPs: {e}")
+                return result
+
+            internal_blocked = set(self._entries.keys())
+
+            only_in_system = system_blocked - internal_blocked
+            only_in_internal = internal_blocked - system_blocked
+
+            for ip in only_in_system:
+                if self.strict_consistency:
+                    entry = BlacklistEntry(
+                        ip_address=ip,
+                        added_at=datetime.now(),
+                        reason="Synced from system firewall",
+                        rule_id="system_sync",
+                        expire_at=None,
+                        extra={'source': 'system_sync'},
+                    )
+                    self._entries[ip] = entry
+                    result['added_to_internal'].append(ip)
+                    self._stats['inconsistencies_found'] += 1
+                    logger.info(f"[SYNC] Added IP {ip} from system firewall to internal list")
+
+            for ip in only_in_internal:
+                entry = self._entries.get(ip)
+                if entry and not entry.is_expired:
+                    if self.strict_consistency:
+                        logger.warning(
+                            f"[SYNC] IP {ip} in internal list but not in system. "
+                            f"Attempting to re-block..."
+                        )
+                        success = self.firewall.block_ip(
+                            ip,
+                            comment=f"{entry.rule_id}: {entry.reason}".strip(": ")
+                        )
+                        if success:
+                            result['added_to_system'].append(ip)
+                            logger.info(f"[SYNC] Re-blocked IP {ip} at system level")
+                        else:
+                            logger.warning(
+                                f"[SYNC] Failed to re-block {ip}. Removing from internal list."
+                            )
+                            self._entries.pop(ip, None)
+                            result['removed_from_internal'].append(ip)
+                            self._stats['inconsistencies_found'] += 1
+                else:
+                    logger.info(f"[SYNC] Removing expired IP {ip} from internal list")
+                    self._entries.pop(ip, None)
+                    result['removed_from_internal'].append(ip)
+
+            if (result['added_to_internal'] or result['removed_from_internal'] or result['added_to_system']) and save:
+                logger.info(
+                    f"[SYNC] Completed: +{len(result['added_to_internal'])} from system, "
+                    f"+{len(result['added_to_system'])} to system, "
+                    f"-{len(result['removed_from_internal'])} from internal"
+                )
+                if self.auto_save:
+                    self._save()
+
+            return result
 
     def get_entry(self, ip: str) -> Optional[BlacklistEntry]:
         entry = self._entries.get(ip)
@@ -446,10 +645,14 @@ class BlacklistManager:
 
     def list_entries(self) -> list[BlacklistEntry]:
         self._cleanup_expired()
+        if self.auto_sync and (time.time() - self._last_sync) > self.sync_interval:
+            self.sync_with_system(save=True)
         return list(self._entries.values())
 
     def list_ips(self) -> list[str]:
         self._cleanup_expired()
+        if self.auto_sync and (time.time() - self._last_sync) > self.sync_interval:
+            self.sync_with_system(save=True)
         return list(self._entries.keys())
 
     def cleanup_expired(self) -> int:
@@ -457,9 +660,18 @@ class BlacklistManager:
 
     def _cleanup_expired(self) -> int:
         expired = [ip for ip, entry in self._entries.items() if entry.is_expired]
+        removed = 0
         for ip in expired:
-            self.unblock_ip(ip)
-        return len(expired)
+            if self.unblock_ip(ip):
+                removed += 1
+        return removed
+
+    def get_stats(self) -> dict:
+        return {
+            **self._stats,
+            'internal_entries': len(self._entries),
+            'last_sync': datetime.fromtimestamp(self._last_sync).isoformat() if self._last_sync else None,
+        }
 
     def _save(self):
         if not self.storage_path:
@@ -468,13 +680,16 @@ class BlacklistManager:
             data = {
                 'saved_at': datetime.now().isoformat(),
                 'entries': [entry.to_dict() for entry in self._entries.values()],
+                'stats': self._stats,
             }
             dir_path = os.path.dirname(self.storage_path)
             if dir_path and not os.path.exists(dir_path):
                 os.makedirs(dir_path, exist_ok=True)
-            with open(self.storage_path, 'w', encoding='utf-8') as f:
+            tmp_path = f"{self.storage_path}.tmp"
+            with open(tmp_path, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
-            logger.debug(f"Blacklist saved to {self.storage_path}")
+            os.replace(tmp_path, self.storage_path)
+            logger.debug(f"Blacklist saved to {self.storage_path} ({len(self._entries)} entries)")
         except Exception as e:
             logger.error(f"Failed to save blacklist: {e}")
 
@@ -486,16 +701,46 @@ class BlacklistManager:
                 data = json.load(f)
             entries_data = data.get('entries', [])
             loaded = 0
+            verified = 0
+
             for ed in entries_data:
                 try:
                     entry = BlacklistEntry.from_dict(ed)
                     if entry.is_expired:
                         continue
+
+                    if self.strict_consistency:
+                        if not self._check_in_blacklist(entry.ip_address):
+                            logger.warning(
+                                f"[LOAD-VERIFY] IP {entry.ip_address} in storage but not blocked "
+                                f"at system level. Attempting to re-block..."
+                            )
+                            success = self.firewall.block_ip(
+                                entry.ip_address,
+                                comment=f"{entry.rule_id}: {entry.reason}".strip(": ")
+                            )
+                            if not success:
+                                logger.warning(
+                                    f"[LOAD-VERIFY] Failed to re-block {entry.ip_address}. "
+                                    f"Skipping this entry."
+                                )
+                                continue
+
                     self._entries[entry.ip_address] = entry
                     loaded += 1
+                    verified += 1
                 except Exception:
                     continue
-            logger.info(f"Loaded {loaded} blacklist entries from {self.storage_path}")
+
+            if 'stats' in data:
+                for k, v in data['stats'].items():
+                    if k in self._stats and isinstance(v, (int, float)):
+                        self._stats[k] = v
+
+            logger.info(
+                f"Loaded {loaded} blacklist entries from {self.storage_path} "
+                f"({verified} verified at system level)"
+            )
         except Exception as e:
             logger.error(f"Failed to load blacklist: {e}")
 

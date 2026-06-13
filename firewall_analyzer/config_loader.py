@@ -29,6 +29,15 @@ class BlacklistConfig:
     storage_path: Optional[str] = None
     default_expire_hours: Optional[int] = None
     auto_save: bool = True
+    auto_sync: bool = True
+    sync_interval_seconds: int = 300
+    strict_consistency: bool = True
+
+
+@dataclass
+class WhitelistConfig:
+    enabled: bool = True
+    rules: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -38,6 +47,7 @@ class AppConfig:
     log_sources: list[LogSourceConfig] = field(default_factory=list)
     rules: list[dict] = field(default_factory=list)
     blacklist: BlacklistConfig = field(default_factory=BlacklistConfig)
+    whitelist: WhitelistConfig = field(default_factory=WhitelistConfig)
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -98,6 +108,15 @@ def _parse_config(raw: dict, source_path: str) -> AppConfig:
         storage_path=bl_storage,
         default_expire_hours=blacklist_raw.get('default_expire_hours', blacklist_raw.get('ttl_hours')),
         auto_save=blacklist_raw.get('auto_save', True),
+        auto_sync=blacklist_raw.get('auto_sync', True),
+        sync_interval_seconds=int(blacklist_raw.get('sync_interval_seconds', 300)),
+        strict_consistency=blacklist_raw.get('strict_consistency', True),
+    )
+
+    whitelist_raw = raw.get('whitelist', {})
+    whitelist_config = WhitelistConfig(
+        enabled=whitelist_raw.get('enabled', True),
+        rules=whitelist_raw.get('rules', []),
     )
 
     rules = raw.get('rules', [])
@@ -109,7 +128,7 @@ def _parse_config(raw: dict, source_path: str) -> AppConfig:
     app_log_level = str(raw.get('log_level', raw.get('logging_level', 'INFO'))).upper()
 
     extra = {k: v for k, v in raw.items() if k not in (
-        'log_sources', 'logs', 'blacklist', 'blocklist', 'rules',
+        'log_sources', 'logs', 'blacklist', 'blocklist', 'whitelist', 'rules',
         'log_level', 'logging_level', 'log_file',
     )}
 
@@ -119,6 +138,7 @@ def _parse_config(raw: dict, source_path: str) -> AppConfig:
         log_sources=log_sources,
         rules=rules,
         blacklist=blacklist_config,
+        whitelist=whitelist_config,
         extra=extra,
     )
 

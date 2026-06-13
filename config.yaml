@@ -14,11 +14,69 @@ log_sources:
     from_beginning: false
     poll_interval: 1.0
 
+  - path: C:/Windows/System32/winevt/Logs/Security.evtx
+    parser: windows_security
+    from_beginning: false
+    poll_interval: 2.0
+
 blacklist:
   enabled: true
   storage_path: data/blacklist.json
   default_expire_hours: 24
   auto_save: true
+  auto_sync: true
+  sync_interval_seconds: 300
+  strict_consistency: true
+
+whitelist:
+  enabled: true
+  rules:
+    - id: wl_internal_net
+      name: Internal Network Trust
+      description: 内网所有IP不封禁
+      enabled: true
+      priority: 10
+      ip_networks:
+        - 192.168.0.0/16
+        - 10.0.0.0/8
+        - 172.16.0.0/12
+      log_hits: true
+      exclude_from_blocking: true
+
+    - id: wl_company_gateway
+      name: Company Gateway IPs
+      description: 公司出口IP跳过封禁
+      enabled: true
+      priority: 20
+      ip_addresses:
+        - 203.0.113.42
+        - 198.51.100.15
+      log_hits: true
+
+    - id: wl_trusted_ports
+      name: Trusted Service Ports
+      description: HTTP/HTTPS等常用服务端口不封禁
+      enabled: true
+      priority: 50
+      ports:
+        - 80
+        - 443
+        - 53
+      port_ranges:
+        - 1024-5000
+      protocols:
+        - TCP
+      match_type: any
+      log_hits: true
+
+    - id: wl_icmp
+      name: ICMP/Ping
+      description: ICMP协议跳过封禁
+      enabled: true
+      priority: 100
+      protocols:
+        - ICMP
+      log_hits: false
 
 rules:
   - id: brute_force_ssh
@@ -36,11 +94,15 @@ rules:
       - field: source_ip
         operator: is_public_ip
         value: true
+      - field: source_ip
+        operator: not_in_cidr
+        value: 203.0.113.0/24,198.51.100.0/24
 
     threshold: 10
     time_window: 3600
     group_by: source_ip
     cooldown: 300
+    auto_unblock_hours: 24
 
     burst_threshold: 5
     burst_window: 10
@@ -48,15 +110,58 @@ rules:
     actions:
       - type: block
         reason: SSH Brute Force Detected
-        expire_hours: 24
 
       - type: command
         command: 'echo "{IP} blocked due to SSH brute force" >> /var/log/fw_blocks.log'
         shell: true
 
+      - type: webhook
+        url: https://api.example.com/alerts/block
+        method: POST
+        headers:
+          Authorization: Bearer YOUR_API_KEY
+        timeout: 10
+        payload:
+          event: ssh_brute_force
+          ip: '{IP}'
+          rule: '{RULE_ID}'
+          count: '{COUNT}'
+
       - type: log
         level: WARNING
         message: SSH brute force attack detected from {IP}
+
+  - id: windows_login_fail
+    name: Windows Failed Login
+    description: Windows 4625事件10分钟内5次失败则拉黑
+    enabled: true
+
+    conditions:
+      - field: event_id
+        operator: eq
+        value: 4625
+      - field: source_ip
+        operator: is_public_ip
+        value: true
+      - field: source_ip
+        operator: not_in_cidr
+        value: 192.168.0.0/16
+
+    threshold: 5
+    time_window: 600
+    group_by: source_ip
+    cooldown: 600
+    auto_unblock_hours: 12
+
+    actions:
+      - type: block
+        reason: Windows Brute Force Login
+
+      - type: webhook
+        url: https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK
+        method: POST
+        payload:
+          text: 'Security Alert: {IP} has been blocked for {COUNT} failed Windows login attempts'
 
   - id: port_scan
     name: Port Scan Detection
@@ -70,16 +175,19 @@ rules:
       - field: source_ip
         operator: is_public_ip
         value: true
+      - field: dest_port
+        operator: not_in_port_range
+        value: 80-443
 
     threshold: 20
     time_window: 60
     group_by: source_ip+dest_port
     cooldown: 600
+    auto_unblock_hours: 12
 
     actions:
       - type: block
         reason: Port Scan Detected
-        expire_hours: 12
 
       - type: log
         level: CRITICAL
@@ -97,20 +205,23 @@ rules:
       - field: action
         operator: eq
         value: DENY
+      - field: source_ip
+        operator: is_public_ip
+        value: true
 
     threshold: 5
     time_window: 300
     group_by: source_ip
     cooldown: 600
+    auto_unblock_hours: 24
 
     actions:
       - type: block
         reason: RDP Brute Force Detected
-        expire_hours: 24
 
   - id: deny_aggressive
     name: Aggressive Deny Blocker
-    description: 同一IP5分钟内被拒绝超过50次则拉黑
+    description: 同一IP5分钟内被拒绝超过50次则拉黑（仅工作时间）
     enabled: true
 
     conditions:
@@ -120,16 +231,22 @@ rules:
       - field: source_ip
         operator: is_public_ip
         value: true
+      - field: ''
+        operator: in_time_range
+        value: 09:00-18:00
+      - field: ''
+        operator: is_day_of_week
+        value: 0,1,2,3,4
 
     threshold: 50
     time_window: 300
     group_by: source_ip
     cooldown: 120
+    auto_unblock_hours: 6
 
     actions:
       - type: block
         reason: Aggressive Deny Traffic
-        expire_hours: 6
 
   - id: telnet_detection
     name: Telnet Access Block
@@ -140,17 +257,46 @@ rules:
       - field: dest_port
         operator: eq
         value: 23
+      - field: source_ip
+        operator: not_in_cidr
+        value: 10.0.0.0/8,192.168.0.0/16
+      - field: protocol
+        operator: in
+        value: [TCP, UDP]
 
     threshold: 1
     time_window: 60
     group_by: source_ip
     cooldown: 0
+    auto_unblock_hours: 48
 
     actions:
       - type: block
         reason: Telnet Access Attempt
-        expire_hours: 48
 
       - type: log
         level: ALERT
         message: Telnet access attempt from {IP}
+
+  - id: windows_firewall_block
+    name: Windows Firewall Blocked (5152/5157)
+    description: Windows防火墙阻止的流量过多则拉黑
+    enabled: true
+
+    conditions:
+      - field: event_id
+        operator: in
+        value: [5152, 5155, 5157, 5159]
+      - field: source_ip
+        operator: is_public_ip
+        value: true
+
+    threshold: 15
+    time_window: 60
+    group_by: source_ip
+    cooldown: 300
+    auto_unblock_hours: 6
+
+    actions:
+      - type: block
+        reason: Windows Firewall Blocked Traffic

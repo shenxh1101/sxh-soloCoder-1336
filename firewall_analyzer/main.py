@@ -12,6 +12,7 @@ from .log_parser import LogParserRegistry, LogEntry
 from .log_monitor import MultiLogMonitor, LogMonitor
 from .rule_engine import RuleEngine, Rule, RuleActionContext
 from .blacklist_manager import BlacklistManager, BlacklistEntry
+from .whitelist_manager import WhitelistManager, WhitelistMatch
 
 logger = logging.getLogger("firewall_analyzer")
 
@@ -64,7 +65,11 @@ class FirewallAnalyzer:
             storage_path=config.blacklist.storage_path,
             auto_save=config.blacklist.auto_save,
             default_expire_hours=config.blacklist.default_expire_hours,
+            auto_sync=config.blacklist.auto_sync,
+            sync_interval_seconds=config.blacklist.sync_interval_seconds,
+            strict_consistency=config.blacklist.strict_consistency,
         )
+        self.whitelist = WhitelistManager()
         self.rule_engine = RuleEngine()
         self._monitor: Optional[MultiLogMonitor] = None
         self._stop_event = threading.Event()
@@ -74,11 +79,13 @@ class FirewallAnalyzer:
             'entries_parsed': 0,
             'rules_triggered': 0,
             'ips_blocked': 0,
+            'whitelist_hits': 0,
             'start_time': time.time(),
         }
 
         self._setup_blacklist_callbacks()
         self._setup_rule_actions()
+        self._load_whitelist_rules()
         self._load_rules()
         self._setup_cleanup_thread()
 
@@ -102,15 +109,46 @@ class FirewallAnalyzer:
         self.blacklist.on_block(on_block)
         self.blacklist.on_unblock(on_unblock)
 
+    def _load_whitelist_rules(self):
+        if not self.config.whitelist.enabled:
+            logger.info("Whitelist disabled in config")
+            return
+
+        rules = self.config.whitelist.rules
+        if not rules:
+            logger.warning("Whitelist enabled but no rules configured")
+            return
+
+        for rule_data in rules:
+            try:
+                self.whitelist.add_rule_from_dict(rule_data)
+            except Exception as e:
+                logger.error(f"Failed to load whitelist rule: {rule_data.get('id', 'unknown')}: {e}")
+
+        logger.info(f"Loaded {len(self.whitelist.list_rules())} whitelist rules")
+
     def _setup_rule_actions(self):
         def block_action(context: RuleActionContext):
             if not context.ip_address:
                 logger.warning(f"Cannot block: no IP address in context for rule {context.rule_id}")
                 return
+
+            latest_entry = context.entries[-1] if context.entries else None
+            if latest_entry:
+                whitelist_match = self.whitelist.should_exclude_from_blocking(latest_entry)
+                if whitelist_match:
+                    logger.info(
+                        f"[WHITELIST-EXCLUDE] Skipping block for {context.ip_address} | "
+                        f"matched rule: {whitelist_match.rule_name} | "
+                        f"reason: {whitelist_match.reason}"
+                    )
+                    return
+
             if self.blacklist.is_blocked(context.ip_address):
                 return
+
             reason = context.extra.get('reason', context.rule_name)
-            expire_hours = context.extra.get('expire_hours')
+            expire_hours = context.extra.get('expire_hours', context.extra.get('auto_unblock_hours'))
             self.blacklist.block_ip(
                 ip=context.ip_address,
                 reason=reason,
@@ -256,8 +294,19 @@ class FirewallAnalyzer:
         with self._stats_lock:
             self._stats['entries_parsed'] += 1
 
+        whitelist_match = self.whitelist.check(entry)
+        if whitelist_match:
+            with self._stats_lock:
+                self._stats['whitelist_hits'] += 1
+            logger.debug(
+                f"Whitelist match: {whitelist_match.rule_name} | "
+                f"source: {entry.source_ip}:{entry.source_port or '-'} | "
+                f"dest: {entry.dest_ip}:{entry.dest_port or '-'}"
+            )
+
         if self.blacklist.is_blocked(entry.source_ip):
             logger.debug(f"Skipping entry from already-blocked IP: {entry.source_ip}")
+            return
 
         self.rule_engine.process_entry(entry)
 
@@ -276,10 +325,18 @@ class FirewallAnalyzer:
         for src in self.config.log_sources:
             logger.info(f"  - {src.path} [parser={src.parser or 'auto'}]")
 
+        if self.config.whitelist.enabled:
+            whitelist_rules = self.whitelist.list_rules()
+            logger.info(f"Whitelist: {len(whitelist_rules)} rule(s) loaded")
+
         if self.config.blacklist.enabled:
             existing_ips = self.blacklist.list_ips()
             logger.info(f"Blacklist storage: {self.config.blacklist.storage_path or 'memory only'}")
             logger.info(f"Existing blocked IPs: {len(existing_ips)}")
+            if self.config.blacklist.strict_consistency:
+                logger.info("Blacklist strict consistency mode: ENABLED")
+            if self.config.blacklist.auto_sync:
+                logger.info(f"Blacklist auto-sync: every {self.config.blacklist.sync_interval_seconds}s")
 
         self._monitor = MultiLogMonitor(
             log_paths=[src.path for src in self.config.log_sources],
@@ -311,10 +368,24 @@ class FirewallAnalyzer:
         logger.info(f"  运行时长: {elapsed:.1f}s ({elapsed/3600:.2f}h)")
         logger.info(f"  处理行数: {stats['lines_processed']}")
         logger.info(f"  解析条目: {stats['entries_parsed']}")
+        logger.info(f"  白名单命中: {stats['whitelist_hits']}")
         logger.info(f"  触发规则: {stats['rules_triggered']}")
         logger.info(f"  拉黑IP数: {stats['ips_blocked']}")
         logger.info(f"  当前黑名单: {len(self.blacklist.list_ips())}")
+        bl_stats = self.blacklist.get_stats()
+        if bl_stats.get('inconsistencies_found', 0) > 0:
+            logger.info(f"  检测不一致: {bl_stats['inconsistencies_found']}")
         logger.info("=" * 40)
+
+        whitelist_stats = self.whitelist.get_hit_stats()
+        if any(s['hits'] > 0 for s in whitelist_stats.values()):
+            logger.info("白名单命中统计 / Whitelist Hit Stats")
+            logger.info("-" * 40)
+            for rid, s in sorted(whitelist_stats.items(), key=lambda x: x[1]['hits'], reverse=True):
+                if s['hits'] > 0:
+                    last_hit = s['last_hit'].strftime('%Y-%m-%d %H:%M:%S') if s['last_hit'] else 'N/A'
+                    logger.info(f"  {s['name']:<30} hits: {s['hits']:<6} last: {last_hit}")
+            logger.info("=" * 40)
 
     def wait(self):
         try:
@@ -436,6 +507,8 @@ def main():
             print(f"        阈值: {rule.threshold}次 / {rule.time_window}s | 分组: {rule.group_by}")
             if rule.burst_threshold:
                 print(f"        突发: {rule.burst_threshold}次 / {rule.burst_window}s")
+            if rule.auto_unblock_hours:
+                print(f"        自动解封: {rule.auto_unblock_hours}小时")
             if rule.description:
                 print(f"        说明: {rule.description}")
             if rule.conditions:

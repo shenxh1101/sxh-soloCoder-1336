@@ -172,51 +172,171 @@ class WindowsSecurityParser(BaseLogParser):
         re.compile(r'(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?)'),
         re.compile(r'(?P<ts>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}(?:[.,]\d+)?)'),
         re.compile(r'<TimeCreated\s+SystemTime=["\'](?P<ts>[^"\']+)["\']'),
+        re.compile(r'^(?P<ts>[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})'),
     ]
 
     EVENT_ID_PATTERNS = [
         r'EventID\s*[=:]\s*"?(\d+)"?',
+        r'Event\s+ID\s*[=:]\s*"?(\d+)"?',
         r'<EventID>(\d+)</EventID>',
+        r'Microsoft-Windows-Security-Auditing[^>]*EventID=(\d+)',
     ]
 
     SRC_PATTERNS = [
         r'Source\s*Network\s*Address\s*[=:]\s*"?(\d{1,3}(?:\.\d{1,3}){3})"?',
+        r'SourceAddress\s*[=:]\s*"?(\d{1,3}(?:\.\d{1,3}){3})"?',
+        r'Source\s*Address\s*[=:]\s*"?(\d{1,3}(?:\.\d{1,3}){3})"?',
         r'IpAddress\s*[=:]\s*"?(\d{1,3}(?:\.\d{1,3}){3})"?',
+        r'IP\s*Address\s*[=:]\s*"?(\d{1,3}(?:\.\d{1,3}){3})"?',
         r'Remote(?:\s*Machine)?\s*Address\s*[=:]\s*"?(\d{1,3}(?:\.\d{1,3}){3})"?',
+        r'Remote\s*IP\s*[=:]\s*"?(\d{1,3}(?:\.\d{1,3}){3})"?',
+        r'Client\s*Address\s*[=:]\s*"?(\d{1,3}(?:\.\d{1,3}){3})"?',
         r'<Data\s+Name=["\']SourceNetworkAddress["\']>(\d{1,3}(?:\.\d{1,3}){3})</Data>',
+        r'<Data\s+Name=["\']SourceAddress["\']>(\d{1,3}(?:\.\d{1,3}){3})</Data>',
         r'<Data\s+Name=["\']IpAddress["\']>(\d{1,3}(?:\.\d{1,3}){3})</Data>',
         r'<Data\s+Name=["\']RemoteAddress["\']>(\d{1,3}(?:\.\d{1,3}){3})</Data>',
+        r'<Data\s+Name=["\']ClientAddress["\']>(\d{1,3}(?:\.\d{1,3}){3})</Data>',
         r'客户端地址\s*[=:]\s*"?(\d{1,3}(?:\.\d{1,3}){3})"?',
+        r'远程地址\s*[=:]\s*"?(\d{1,3}(?:\.\d{1,3}){3})"?',
     ]
 
     DST_PATTERNS = [
         r'Destination\s*Network\s*Address\s*[=:]\s*"?(\d{1,3}(?:\.\d{1,3}){3})"?',
-        r'Dest(?:ination)?\s*Address\s*[=:]\s*"?(\d{1,3}(?:\.\d{1,3}){3})"?',
+        r'DestAddress\s*[=:]\s*"?(\d{1,3}(?:\.\d{1,3}){3})"?',
+        r'Destination\s*Address\s*[=:]\s*"?(\d{1,3}(?:\.\d{1,3}){3})"?',
+        r'Dest(?:ination)?\s*IP\s*[=:]\s*"?(\d{1,3}(?:\.\d{1,3}){3})"?',
+        r'Local\s*Address\s*[=:]\s*"?(\d{1,3}(?:\.\d{1,3}){3})"?',
         r'<Data\s+Name=["\']DestAddress["\']>(\d{1,3}(?:\.\d{1,3}){3})</Data>',
+        r'<Data\s+Name=["\']DestinationAddress["\']>(\d{1,3}(?:\.\d{1,3}){3})</Data>',
+        r'<Data\s+Name=["\']LocalAddress["\']>(\d{1,3}(?:\.\d{1,3}){3})</Data>',
+        r'目标地址\s*[=:]\s*"?(\d{1,3}(?:\.\d{1,3}){3})"?',
+        r'本地地址\s*[=:]\s*"?(\d{1,3}(?:\.\d{1,3}){3})"?',
     ]
 
     DPT_PATTERNS = [
         r'Destination\s*Port\s*[=:]\s*"?(\d+)"?',
+        r'DestPort\s*[=:]\s*"?(\d+)"?',
         r'Dest(?:ination)?\s*Port\s*[=:]\s*"?(\d+)"?',
+        r'Local\s*Port\s*[=:]\s*"?(\d+)"?',
+        r'Target\s*Port\s*[=:]\s*"?(\d+)"?',
         r'<Data\s+Name=["\']DestPort["\']>(\d+)</Data>',
+        r'<Data\s+Name=["\']DestinationPort["\']>(\d+)</Data>',
+        r'<Data\s+Name=["\']LocalPort["\']>(\d+)</Data>',
+        r'目标端口\s*[=:]\s*"?(\d+)"?',
+        r'本地端口\s*[=:]\s*"?(\d+)"?',
+    ]
+
+    SPT_PATTERNS = [
+        r'Source\s*Port\s*[=:]\s*"?(\d+)"?',
+        r'SrcPort\s*[=:]\s*"?(\d+)"?',
+        r'Remote\s*Port\s*[=:]\s*"?(\d+)"?',
+        r'<Data\s+Name=["\']SourcePort["\']>(\d+)</Data>',
+        r'<Data\s+Name=["\']RemotePort["\']>(\d+)</Data>',
+        r'源端口\s*[=:]\s*"?(\d+)"?',
+        r'远程端口\s*[=:]\s*"?(\d+)"?',
     ]
 
     PROTO_PATTERNS = [
         r'Protocol\s*[=:]\s*"?(\w+)"?',
+        r'Protocol\s*Type\s*[=:]\s*"?(\w+)"?',
         r'<Data\s+Name=["\']Protocol["\']>(\w+)</Data>',
+        r'<Data\s+Name=["\']ProtocolType["\']>(\w+)</Data>',
+        r'协议\s*[=:]\s*"?(\w+)"?',
     ]
 
-    BLOCK_EVENT_IDS = {'4625', '5152', '5155', '5157', '5159', '4624', '4776', '4771', '4768', '4769'}
-    DENY_EVENT_IDS = {'4625', '5152', '5155', '5157', '5159'}
+    LOGON_TYPE_PATTERNS = [
+        r'Logon\s*Type\s*[=:]\s*"?(\w+)"?',
+        r'<Data\s+Name=["\']LogonType["\']>(\w+)</Data>',
+        r'登录类型\s*[=:]\s*"?(\w+)"?',
+    ]
+
+    FAILURE_REASON_PATTERNS = [
+        r'Failure\s*Reason\s*[=:]\s*"([^"]+)"?',
+        r'<Data\s+Name=["\']FailureReason["\']>([^<]+)</Data>',
+        r'失败原因\s*[=:]\s*"([^"]+)"?',
+    ]
+
+    KEYWORD_PATTERNS = [
+        r'Keywords\s*[=:]\s*"([^"]+)"?',
+        r'<Keywords>([^<]+)</Keywords>',
+        r'关键字\s*[=:]\s*"([^"]+)"?',
+    ]
+
+    DENY_EVENT_IDS = {
+        '4625': 'DENY',
+        '4771': 'DENY',
+        '4772': 'DENY',
+        '4776': 'DENY',
+        '4768': 'DENY',
+        '4769': 'DENY',
+        '5152': 'DENY',
+        '5155': 'DENY',
+        '5157': 'DENY',
+        '5159': 'DENY',
+        '5151': 'DENY',
+        '5153': 'DENY',
+        '5154': 'DENY',
+        '4634': 'ALLOW',
+        '4624': 'ALLOW',
+        '4647': 'ALLOW',
+        '4672': 'ALLOW',
+    }
+
+    EVENT_DESCRIPTIONS = {
+        '4624': '账户登录成功',
+        '4625': '账户登录失败',
+        '4634': '账户注销',
+        '4771': 'Kerberos预身份验证失败',
+        '4772': 'Kerberos身份验证票证请求失败',
+        '4776': '域控制器尝试验证账户凭据失败',
+        '4768': 'Kerberos身份验证票证(TGT)请求',
+        '4769': 'Kerberos服务票证请求',
+        '5152': 'Windows过滤平台阻止数据包',
+        '5155': 'Windows过滤平台阻止应用或服务监听端口',
+        '5157': 'Windows过滤平台阻止连接',
+        '5159': 'Windows过滤平台阻止绑定到本地端口',
+        '5151': 'Windows过滤平台允许数据包',
+        '5153': 'Windows过滤平台允许应用或服务监听端口',
+        '5154': 'Windows过滤平台允许连接',
+        '4647': '用户发起注销',
+        '4672': '管理员登录',
+    }
+
+    LOGON_TYPE_MAP = {
+        '2': '交互式登录',
+        '3': '网络登录',
+        '4': '批处理登录',
+        '5': '服务登录',
+        '7': '解锁',
+        '8': '网络明文登录',
+        '9': '新凭据登录',
+        '10': '远程交互登录(RDP)',
+        '11': '缓存交互登录',
+    }
 
     def can_parse(self, line: str) -> bool:
-        if re.search(r'EventID\s*[=:]\s*"?(4625|5152|5155|5157|5159)"?', line, re.IGNORECASE):
+        line_upper = line.upper()
+        has_event_id = bool(re.search(
+            r'EventID\s*[=:]\s*"?(4625|4771|4772|4776|4768|4769|5152|5155|5157|5159|5151|5153|5154|4624)\b',
+            line, re.IGNORECASE
+        ))
+        if has_event_id:
             return True
-        if '<Event' in line and ('4625' in line or '5152' in line or '5157' in line):
+
+        if '<Event' in line and re.search(r'<EventID>(4625|477[126]|476[89]|515[2-9]|515[134]|4624)</EventID>', line, re.IGNORECASE):
             return True
-        if re.search(r'(Source\s*Network\s*Address|IpAddress|SourceAddress)', line, re.IGNORECASE):
-            if re.search(r'(EventID|Event\s*ID)', line, re.IGNORECASE):
-                return True
+
+        has_ip_field = bool(re.search(
+            r'(Source\s*Network\s*Address|SourceAddress|IpAddress|Remote\s*Address|Client\s*Address)\s*[=:]',
+            line, re.IGNORECASE
+        ))
+        has_event_id_field = bool(re.search(r'(EventID|Event\s*ID)\s*[=:]', line, re.IGNORECASE))
+        if has_ip_field and has_event_id_field:
+            return True
+
+        if 'Security-Auditing' in line_upper and re.search(r'\d{1,3}(?:\.\d{1,3}){3}', line):
+            return True
+
         return False
 
     def parse(self, line: str) -> Optional[LogEntry]:
@@ -232,23 +352,45 @@ class WindowsSecurityParser(BaseLogParser):
         event_id = self._search_field(line, self.EVENT_ID_PATTERNS)
         entry.extra['event_id'] = event_id
 
-        if event_id in self.DENY_EVENT_IDS:
-            entry.action = 'DENY'
-            if event_id == '4625':
-                entry.extra['description'] = 'Account failed to log on (RDP/SSH brute force suspect)'
-            else:
-                entry.extra['description'] = 'Windows Filtering Platform blocked packet/connection'
+        if event_id:
+            if event_id in self.DENY_EVENT_IDS:
+                entry.action = self.DENY_EVENT_IDS[event_id]
+                entry.extra['description'] = self.EVENT_DESCRIPTIONS.get(event_id, '')
+
+        logon_type = self._search_field(line, self.LOGON_TYPE_PATTERNS)
+        if logon_type:
+            entry.extra['logon_type'] = self.LOGON_TYPE_MAP.get(logon_type, logon_type)
+            entry.extra['logon_type_id'] = logon_type
+
+        failure_reason = self._search_field(line, self.FAILURE_REASON_PATTERNS)
+        if failure_reason:
+            entry.extra['failure_reason'] = failure_reason.strip()
+
+        keywords = self._search_field(line, self.KEYWORD_PATTERNS)
+        if keywords:
+            entry.extra['keywords'] = keywords.strip()
 
         entry.source_ip = self._search_field(line, self.SRC_PATTERNS)
         entry.dest_ip = self._search_field(line, self.DST_PATTERNS)
+        entry.source_port = self._search_int(line, self.SPT_PATTERNS)
         entry.dest_port = self._search_int(line, self.DPT_PATTERNS)
 
         proto = self._search_field(line, self.PROTO_PATTERNS)
         if proto:
-            proto_map = {'6': 'TCP', '17': 'UDP', '1': 'ICMP'}
+            proto_map = {'6': 'TCP', '17': 'UDP', '1': 'ICMP', '2': 'IGMP', '41': 'IPv6', '47': 'GRE', '50': 'ESP', '51': 'AH', '89': 'OSPF', '132': 'SCTP'}
             entry.protocol = proto_map.get(proto, proto.upper())
 
-        if entry.source_ip or entry.dest_ip:
+        if event_id == '4625' and not entry.dest_port:
+            logon_type_id = entry.extra.get('logon_type_id', '')
+            if logon_type_id == '10':
+                entry.dest_port = 3389
+            elif logon_type_id in ('2', '3', '7', '8', '9', '11'):
+                entry.extra['potential_ports'] = [22, 3389, 445, 135, 139, 5985, 5986]
+
+        if event_id in ('5152', '5157') and entry.dest_port and not entry.protocol:
+            entry.protocol = 'TCP'
+
+        if entry.source_ip or entry.dest_ip or entry.action:
             return entry
         return None
 
@@ -261,8 +403,11 @@ class WindowsSecurityParser(BaseLogParser):
                     ts = ts.replace('Z', '+00:00')
                     if 'T' in ts:
                         return datetime.fromisoformat(ts).replace(tzinfo=None)
-                    else:
+                    elif ts.count('-') >= 2:
                         return datetime.strptime(ts.split(',')[0].split('.')[0], '%Y-%m-%d %H:%M:%S')
+                    else:
+                        current_year = datetime.now().year
+                        return datetime.strptime(f"{current_year} {ts}", '%Y %b %d %H:%M:%S')
                 except (ValueError, TypeError):
                     continue
         return datetime.now()
